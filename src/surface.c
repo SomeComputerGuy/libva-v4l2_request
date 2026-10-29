@@ -24,6 +24,7 @@
 #include <va/va_drmcommon.h>
 
 #include "v4l2_request.h"
+#include "devpool.h"
 
 VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 			       unsigned int width, unsigned int height,
@@ -331,7 +332,8 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 		bool mplane;
 		int fd;
 
-		fd = open(drv->decoders[n].video_path, O_RDWR | O_CLOEXEC);
+		fd = v4l2r_devpool_open(drv->decoders[n].video_path,
+					O_RDWR | O_NONBLOCK);
 		if (fd < 0)
 			continue;
 
@@ -455,13 +457,13 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 		}
 
 		backing->pixelformat = pixelformat;
-		close(fd);
+		v4l2r_devpool_close(fd);
 
 		surface->backing = backing;
 		return VA_STATUS_SUCCESS;
 
 next:
-		close(fd);
+		v4l2r_devpool_close(fd);
 	}
 
 	free(backing);

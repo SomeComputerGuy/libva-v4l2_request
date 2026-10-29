@@ -24,6 +24,7 @@
 #include <linux/videodev2.h>
 
 #include "v4l2_request.h"
+#include "devpool.h"
 
 static int set_format(struct v4l2r_context *ctx, enum v4l2_buf_type type,
 		      uint32_t pixelformat, uint32_t buffersize)
@@ -767,7 +768,8 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 	for (unsigned int n = 0; n < drv->nb_decoders; n++) {
 		decoder = &drv->decoders[order[n]];
 
-		ctx->video_fd = open(decoder->video_path, O_RDWR | O_NONBLOCK);
+		ctx->video_fd = v4l2r_devpool_open(decoder->video_path,
+						   O_RDWR | O_NONBLOCK);
 		if (ctx->video_fd < 0)
 			continue;
 
@@ -823,7 +825,7 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 		    !(ctx->output_capabilities & V4L2_BUF_CAP_SUPPORTS_REQUESTS))
 			goto next;
 
-		ctx->media_fd = open(decoder->media_path, O_RDWR);
+		ctx->media_fd = v4l2r_devpool_open(decoder->media_path, O_RDWR);
 		if (ctx->media_fd < 0)
 			goto next;
 
@@ -852,10 +854,10 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 
 next:
 		if (ctx->media_fd >= 0) {
-			close(ctx->media_fd);
+			v4l2r_devpool_close(ctx->media_fd);
 			ctx->media_fd = -1;
 		}
-		close(ctx->video_fd);
+		v4l2r_devpool_close(ctx->video_fd);
 		ctx->video_fd = -1;
 		decoder = NULL;
 	}
@@ -939,9 +941,9 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 	pthread_mutex_unlock(&drv->mutex);
 
 	if (ctx->video_fd >= 0)
-		close(ctx->video_fd);
+		v4l2r_devpool_close(ctx->video_fd);
 	if (ctx->media_fd >= 0)
-		close(ctx->media_fd);
+		v4l2r_devpool_close(ctx->media_fd);
 
 	if (ctx->codec && ctx->codec->uninit && ctx->codec_priv)
 		ctx->codec->uninit(ctx);

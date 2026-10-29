@@ -11,6 +11,7 @@ sources = [
   'codec_h264.c',
   'codec_hevc.c',
   'hevc_rps.c',
+  'devpool.c',
   'codec_vp8.c',
   'codec_vp9.c',
   'codec_av1.c',

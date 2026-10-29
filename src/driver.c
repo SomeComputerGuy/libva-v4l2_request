@@ -7,6 +7,7 @@
  */
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@
 #include <drm_fourcc.h>
 
 #include "v4l2_request.h"
+#include "devpool.h"
 
 /* Needs the va.h types pulled in by v4l2_request.h. */
 #include <va/va_backend_vpp.h>
@@ -463,7 +465,17 @@ done:
 	close(media_fd);
 }
 
-static void enumerate_decoders(struct v4l2r_driver *drv)
+/*
+ * The probe result is cached for the process: a client may initialize the
+ * driver again after a sandbox has taken away its right to open device
+ * nodes (see devpool.c), and probing costs dozens of opens/ioctls anyway.
+ */
+static struct v4l2r_decoder probed_decoders[V4L2R_MAX_DECODERS];
+static unsigned int nb_probed_decoders;
+static bool decoders_probed;
+static pthread_mutex_t probe_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void probe_decoders(struct v4l2r_driver *drv)
 {
 	const char *env_media = getenv("LIBVA_V4L2_REQUEST_MEDIA_PATH");
 
@@ -480,6 +492,29 @@ static void enumerate_decoders(struct v4l2r_driver *drv)
 			continue;
 
 		probe_media_device(drv, media_path);
+	}
+}
+
+static void enumerate_decoders(struct v4l2r_driver *drv)
+{
+	pthread_mutex_lock(&probe_mutex);
+	if (!decoders_probed) {
+		probe_decoders(drv);
+		memcpy(probed_decoders, drv->decoders, sizeof(probed_decoders));
+		nb_probed_decoders = drv->nb_decoders;
+		decoders_probed = nb_probed_decoders > 0;
+	} else {
+		memcpy(drv->decoders, probed_decoders, sizeof(probed_decoders));
+		drv->nb_decoders = nb_probed_decoders;
+	}
+	pthread_mutex_unlock(&probe_mutex);
+
+	/* Keep descriptors for a few contexts per decoder open, see devpool.c. */
+	for (unsigned int i = 0; i < drv->nb_decoders; i++) {
+		v4l2r_devpool_reserve(drv->decoders[i].video_path, O_RDWR | O_NONBLOCK,
+				      true, V4L2R_DEVPOOL_PER_DECODER);
+		v4l2r_devpool_reserve(drv->decoders[i].media_path, O_RDWR,
+				      false, V4L2R_DEVPOOL_PER_DECODER);
 	}
 }
 
