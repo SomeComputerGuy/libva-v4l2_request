@@ -161,11 +161,34 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 	struct v4l2r_config *cfg;
+	uint32_t max_width = 0, max_height = 0;
 	unsigned int i = 0;
 
 	cfg = V4L2R_CONFIG_GET(drv, config);
 	if (!cfg)
 		return VA_STATUS_ERROR_INVALID_CONFIG;
+
+	/*
+	 * Report the largest coded size any decoder for this codec takes, so
+	 * clients (FFmpeg, Chromium) fall back to software for streams the
+	 * hardware cannot decode instead of failing at decode time.
+	 */
+	for (unsigned int d = 0; cfg->codec && d < drv->nb_decoders; d++) {
+		const struct v4l2r_decoder *dec = &drv->decoders[d];
+
+		for (unsigned int f = 0; f < dec->nb_pixelformats; f++) {
+			if (dec->pixelformats[f] != cfg->codec->pixelformat)
+				continue;
+			if (dec->max_width[f] > max_width)
+				max_width = dec->max_width[f];
+			if (dec->max_height[f] > max_height)
+				max_height = dec->max_height[f];
+		}
+	}
+	if (!max_width || !max_height) {
+		max_width = 65536;
+		max_height = 65536;
+	}
 
 	if (!attrib_list) {
 		*num_attribs = 8;
@@ -220,13 +243,13 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
 	attrib_list[i].type = VASurfaceAttribMaxWidth;
 	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
 	attrib_list[i].value.type = VAGenericValueTypeInteger;
-	attrib_list[i].value.value.i = 65536;
+	attrib_list[i].value.value.i = max_width;
 	i++;
 
 	attrib_list[i].type = VASurfaceAttribMaxHeight;
 	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
 	attrib_list[i].value.type = VAGenericValueTypeInteger;
-	attrib_list[i].value.value.i = 65536;
+	attrib_list[i].value.value.i = max_height;
 	i++;
 
 	*num_attribs = i;

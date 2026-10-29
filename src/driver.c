@@ -356,6 +356,7 @@ static bool video_device_is_request_decoder(const char *path,
 			.pixel_format = fmtdesc.pixelformat,
 		};
 		uint64_t area = 0;
+		uint32_t max_w = 0, max_h = 0;
 
 		/* Remember the largest coded size, to prefer the most capable
 		 * decoder when several take the same codec (e.g. RK3588 rkvdec
@@ -368,12 +369,23 @@ static bool video_device_is_request_decoder(const char *path,
 
 			if (a > area)
 				area = a;
+			if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+				if (frmsize.discrete.width > max_w)
+					max_w = frmsize.discrete.width;
+				if (frmsize.discrete.height > max_h)
+					max_h = frmsize.discrete.height;
+			} else {
+				max_w = frmsize.stepwise.max_width;
+				max_h = frmsize.stepwise.max_height;
+			}
 			if (frmsize.type != V4L2_FRMSIZE_TYPE_DISCRETE)
 				break;
 			frmsize.index++;
 		}
 
 		decoder->max_area[decoder->nb_pixelformats] = area;
+		decoder->max_width[decoder->nb_pixelformats] = max_w;
+		decoder->max_height[decoder->nb_pixelformats] = max_h;
 		decoder->pixelformats[decoder->nb_pixelformats++] =
 			fmtdesc.pixelformat;
 		fmtdesc.index++;
