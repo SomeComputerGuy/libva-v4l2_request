@@ -112,15 +112,16 @@ static void ref_pic_lists_modification(struct hevc_context *codec,
 			struct v4l2r_bits *b, uint32_t num_ref_idx_l0_active_minus1,
 			uint32_t num_ref_idx_l1_active_minus1, bool slice_type_b)
 {
-	if(v4l2r_bits_bit(b)) {	/* ref_pic_list_modification_flag_l0 */
+	/* list_entry_lX[i] are u(v) with Ceil(Log2(NumPicTotalCurr)) bits (7.4.7.2) */
+	unsigned int bits = ceil_log2(codec->num_pic_total_curr);
+
+	if (v4l2r_bits_bit(b))		/* ref_pic_list_modification_flag_l0 */
 		for (uint32_t i = 0; i <= num_ref_idx_l0_active_minus1; i++)
-			v4l2r_bits_read(b, codec->num_pic_total_curr);	/* list_entry_l0[i] */
-		if (slice_type_b &&
-				v4l2r_bits_bit(b))	/* ref_pic_list_modification_flag_l1 */
-			for (uint32_t i = 0; i <= num_ref_idx_l1_active_minus1; i++)
-				/* list_entry_l1[i] */
-				v4l2r_bits_read(b, codec->num_pic_total_curr);
-	}
+			v4l2r_bits_read(b, bits);	/* list_entry_l0[i] */
+	if (slice_type_b &&
+	    v4l2r_bits_bit(b))		/* ref_pic_list_modification_flag_l1 */
+		for (uint32_t i = 0; i <= num_ref_idx_l1_active_minus1; i++)
+			v4l2r_bits_read(b, bits);	/* list_entry_l1[i] */
 }
 
 /* generalised 7.3.6.3 Weighted prediction parameters syntax */
@@ -164,11 +165,12 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 	bool first_slice_in_pic, dependent_slice = false;
 	bool slice_temporal_mvp_enabled_flag = false;
 	bool slice_sao_luma_flag = false, slice_sao_chroma_flag = false;
-	bool slice_deblocking_filter_disabled_flag = false;
-	bool collocated_from_l0_flag = false;
+	bool slice_deblocking_filter_disabled_flag =
+		codec->va_pic.slice_parsing_fields.bits.pps_disable_deblocking_filter_flag;
+	bool collocated_from_l0_flag = true;	/* inferred 1 when absent */
 	uint32_t chroma_array_type, slice_type;
 	uint32_t offset_len_minus1;
-	uint32_t num_ref_idx_l0_active_minus1 = 0, num_ref_idx_l1_active_minus1 = 0;
+	uint32_t num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1;
 	bool idr, irap;
 	struct v4l2r_bits b;
 	size_t mark;
@@ -316,6 +318,9 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 			if (chroma_array_type != 0)
 				slice_sao_chroma_flag = v4l2r_bits_bit(&b);
 		}
+		/* inferred from the PPS unless overridden (7.4.7.1) */
+		num_ref_idx_l0_active_minus1 = pic->num_ref_idx_l0_default_active_minus1;
+		num_ref_idx_l1_active_minus1 = pic->num_ref_idx_l1_default_active_minus1;
 		if (slice_type == V4L2_HEVC_SLICE_TYPE_P
 				|| slice_type == V4L2_HEVC_SLICE_TYPE_B) {
 			if(v4l2r_bits_bit(&b)) {	/* num_ref_idx_active_override_flag */
@@ -338,9 +343,9 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 				if (slice_type == V4L2_HEVC_SLICE_TYPE_B)
 					collocated_from_l0_flag = v4l2r_bits_bit(&b);
 				if ((collocated_from_l0_flag &&
-						pic->num_ref_idx_l0_default_active_minus1 > 0)
+						num_ref_idx_l0_active_minus1 > 0)
 						|| (!collocated_from_l0_flag &&
-						pic->num_ref_idx_l1_default_active_minus1 > 0))
+						num_ref_idx_l1_active_minus1 > 0))
 					v4l2r_bits_ue(&b);	/* collocated_ref_idx */
 			}
 			if ((pic->pic_fields.bits.weighted_pred_flag &&
