@@ -9,14 +9,13 @@ testing done on Orange Pi 5+ (RK3588) and is thus fine-tuned for the use
 on RK3399 and RK3588. It will likely need some tuning to run optimally on
 other SoCs that have upstream Linux stateless video decode drivers.
 
-Specifically on RK3588 it's impossible to support HEVC decoding using VA-API,
-AFAIK, due to major, un-workaroundable API mismatch. On RK3399 the support
-is very good for all codecs the HW supports. You'll be able to have HW
-acceleration out of the box on Firefox and in mpv just by installing the
-VA-API driver. No patching of other projects is needed. For HEVC decoding
-you'll need a kernel patch for RGA2 driver, which is used to convert 10bit
-NV15 pixel format to NV12 understood by unpatched upstream mpv/ffmpeg/Firefox
-projects. See details below.
+On RK3588 (and RK3576) the HEVC decoder parses slice headers in hardware
+and wants the SPS reference picture set tables, which VA-API does not
+carry; the driver rewrites every slice segment header to code its RPS
+explicitly (see "HEVC on Rockchip VDPU381/VDPU383" below). For 10-bit
+decoding you'll need a kernel patch for the RGA2 driver, which is used to
+convert the 10-bit NV15 pixel format to NV12 understood by unpatched
+upstream mpv/ffmpeg/Firefox. See details below.
 
 Supported codecs (compiled in when the kernel uAPI headers provide the
 stateless interface): MPEG-2, H.264, HEVC, VP8, VP9, AV1.
@@ -407,12 +406,43 @@ Known limitations
   that parse slice headers in hardware (rkvdec).
 - HEVC entry point offsets are not passed (libva has no usable subsets
   buffer definition); purely a WPP performance hint for Hantro G2.
-- HEVC on decoders that require the full SPS reference picture set
-  tables (Rockchip rkvdec2/vdpu38x EXT_SPS_ST_RPS controls) is declined:
-  VA-API never exposes the SPS st_ref_pic_set() syntax, so these devices
-  cannot be driven correctly over VA-API at all.
 - Tiled/compressed CAPTURE formats can be exported as dma-bufs but not
   read back with vaGetImage() (no CPU detiling).
+
+
+HEVC on Rockchip VDPU381/VDPU383
+--------------------------------
+
+These decoders (rkvdec on RK3588/RK3576) parse the slice segment header
+in hardware and resolve short_term_ref_pic_set_idx and lt_idx_sps through
+tables built from the SPS st_ref_pic_set() and lt_ref_pic_poc_lsb_sps
+syntax (V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS/_LT_RPS). VA-API only
+describes the reference picture set of the current picture, so the driver
+rewrites each slice segment header to code that set explicitly
+(short_term_ref_pic_set_sps_flag = 0, no inter RPS prediction, long-term
+entries with poc_lsb_lt) and tells the decoder the SPS has no RPS
+candidates. Only the header is rewritten; the slice data is appended from
+the VA buffer unchanged, so the bitstream is still copied once.
+
+tests/hevc_rps_test applies the same transformation to an Annex-B stream
+and tests/hevc_rps_check.py compares FFmpeg software decodes of the
+original and rewritten streams: 146 of the 147 JCT-VC HEVC_v1 conformance
+vectors decode identically (the remaining one, TSUNEQBD_A_MAIN10, cannot
+be decoded by FFmpeg at all). Run it with
+-Dhevc_conformance_dir=<dir with JCT-VC-HEVC_V1.json and the unpacked
+vectors in x/> and `meson test`.
+
+
+Sandboxed clients
+-----------------
+
+The decoder probe is cached for the process and two descriptors per
+decoder video and media node are kept open, so a client that initializes
+VA-API before engaging a sandbox that forbids opening device nodes (the
+Chromium GPU process) can still create decoders. V4L2R_FD_POOL=0
+disables the pool. Firefox decodes in its RDD process, whose sandbox is
+engaged before VA-API is touched; it needs /dev/media* access granted by
+the sandbox (Mozilla bug 2080696) or MOZ_DISABLE_RDD_SANDBOX=1.
 
 
 License
