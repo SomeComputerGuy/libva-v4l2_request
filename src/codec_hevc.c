@@ -93,8 +93,7 @@ struct hevc_context {
 	bool normalize_rps;
 	struct hevc_rps_set rps_set;
 	VASliceParameterBufferHEVC va_slice_tmp;
-	uint8_t *scratch;
-	size_t scratch_size;
+	uint8_t header[HEVC_RPS_OUT_SIZE];
 	unsigned int rps_errors;
 };
 
@@ -866,36 +865,25 @@ static void hevc_fill_rps_ps(const VAPictureParameterBufferHEVC *pic,
 }
 
 /*
- * Rewrite one slice NAL unit to carry its RPS explicitly. On success
- * out and out_size describe the rewritten NAL in codec->scratch and info is
- * updated with the sizes of the new header's RPS syntax.
+ * Rewrite the slice segment header of one slice NAL unit to carry its RPS
+ * explicitly. The new NAL unit is codec->header[0 .. *header_size) followed
+ * by data[*data_offset .. size); info is updated for the new header.
  */
 static VAStatus hevc_normalize_slice(struct hevc_context *codec,
 				     const uint8_t *data, size_t size,
 				     struct hevc_slice_info *info,
-				     const uint8_t **out, size_t *out_size,
-				     uint32_t *data_byte_offset)
+				     size_t *header_size, size_t *data_offset)
 {
-	size_t need = size + 64 + size / 64 + (HEVC_RPS_MAX_ST + HEVC_RPS_MAX_LT) * 8;
 	struct hevc_rps_result res;
 	struct hevc_rps_ps ps;
 	int ret;
 
-	if (codec->scratch_size < need) {
-		uint8_t *p = realloc(codec->scratch, need);
-
-		if (!p)
-			return VA_STATUS_ERROR_ALLOCATION_FAILED;
-		codec->scratch = p;
-		codec->scratch_size = need;
-	}
-
 	hevc_fill_rps_ps(&codec->va_pic, &ps);
 	codec->rps_set.num_pic_total_curr = codec->num_pic_total_curr;
 
-	ret = hevc_rps_rewrite_slice(&ps, &codec->rps_set, data, size,
-				     codec->scratch, codec->scratch_size,
-				     out_size, &res);
+	ret = hevc_rps_rewrite_header(&ps, &codec->rps_set, data, size,
+				      codec->header, sizeof(codec->header),
+				      header_size, &res);
 	if (ret) {
 		if (codec->rps_errors++ < 10)
 			v4l2r_log("hevc: cannot rewrite slice header of POC %d: %s\n",
@@ -903,8 +891,7 @@ static VAStatus hevc_normalize_slice(struct hevc_context *codec,
 		return VA_STATUS_ERROR_DECODING_ERROR;
 	}
 
-	*out = codec->scratch;
-	*data_byte_offset = res.data_byte_offset;
+	*data_offset = res.src_data_offset;
 	info->nal_unit_type = res.nal_unit_type;
 	info->temporal_id_plus1 = res.temporal_id_plus1;
 	info->no_output_of_prior_pics = res.no_output_of_prior_pics;
@@ -986,6 +973,7 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 {
 	struct hevc_context *codec = ctx->codec_priv;
 	const uint8_t *slice_data = data + va_slice->slice_data_offset;
+	size_t header_size = 0, data_offset = 0;
 	struct hevc_slice_info info;
 	VAStatus status;
 
@@ -1019,20 +1007,18 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 
 	if (codec->normalize_rps) {
 		VASliceParameterBufferHEVC *s = &codec->va_slice_tmp;
-		uint32_t data_byte_offset;
-		size_t size;
 
 		status = hevc_normalize_slice(codec, slice_data,
 					      va_slice->slice_data_size, &info,
-					      &slice_data, &size, &data_byte_offset);
+					      &header_size, &data_offset);
 		if (status != VA_STATUS_SUCCESS)
 			return status;
 
 		/* The slice params below describe the rewritten NAL unit. */
 		*s = *va_slice;
 		s->slice_data_offset = 0;
-		s->slice_data_size = size;
-		s->slice_data_byte_offset = data_byte_offset;
+		s->slice_data_size = header_size + va_slice->slice_data_size - data_offset;
+		s->slice_data_byte_offset = header_size;
 		va_slice = s;
 	}
 
@@ -1056,7 +1042,15 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 			return status;
 	}
 
-	status = v4l2r_append_output(ctx, slice_data, va_slice->slice_data_size);
+	if (codec->normalize_rps) {
+		/* new header, then the slice data straight from the VA buffer */
+		status = v4l2r_append_output(ctx, codec->header, header_size);
+		if (status == VA_STATUS_SUCCESS)
+			status = v4l2r_append_output(ctx, slice_data + data_offset,
+						     va_slice->slice_data_size - header_size);
+	} else {
+		status = v4l2r_append_output(ctx, slice_data, va_slice->slice_data_size);
+	}
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
@@ -1171,7 +1165,6 @@ static void hevc_uninit(struct v4l2r_context *ctx)
 	free(codec->slice_params);
 	free(codec->va_slices);
 	free(codec->entry_point_offsets);
-	free(codec->scratch);
 	codec->slice_params = NULL;
 	codec->va_slices = NULL;
 	codec->entry_point_offsets = NULL;

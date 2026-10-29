@@ -859,7 +859,8 @@ int main(int argc, char **argv)
 
 		struct hevc_rps_result res;
 		size_t on = 0;
-		int ret = hevc_rps_rewrite_slice(&g_ps_cur, &g_rps, nal, n, tmp, cap * 2, &on, &res);
+		int ret = hevc_rps_rewrite_header(&g_ps_cur, &g_rps, nal, n, tmp, HEVC_RPS_OUT_SIZE,
+						  &on, &res);
 		if (ret) {
 			fprintf(stderr, "poc %d nut %u: rewrite failed: %s\n", g_rps.poc, nut,
 				hevc_rps_strerror(ret));
@@ -871,7 +872,8 @@ int main(int argc, char **argv)
 			g_stats_rewritten++;
 		else
 			g_stats_copied++;
-		put_nal(out, tmp, on);
+		memcpy(tmp + on, nal + res.src_data_offset, n - res.src_data_offset);
+		put_nal(out, tmp, on + n - res.src_data_offset);
 	}
 	fclose(out);
 	printf("rewritten %u copied %u skipped %u failed %u\n", g_stats_rewritten,

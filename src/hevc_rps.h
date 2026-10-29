@@ -32,6 +32,12 @@
 
 #define HEVC_RPS_MAX_ST		16
 #define HEVC_RPS_MAX_LT		32
+/* Largest slice segment header handled (RBSP bytes, including entry points). */
+#define HEVC_RPS_MAX_HEADER	4096
+/* How much an explicit RPS can add to a header. */
+#define HEVC_RPS_HEADER_GROWTH	512
+/* Output buffer size that is always enough for hevc_rps_rewrite_header(). */
+#define HEVC_RPS_OUT_SIZE	((HEVC_RPS_MAX_HEADER + HEVC_RPS_HEADER_GROWTH) * 3 / 2)
 
 /* What the slice header parser needs to know about the active SPS/PPS. */
 struct hevc_rps_ps {
@@ -96,17 +102,17 @@ struct hevc_rps_set {
 };
 
 struct hevc_rps_result {
-	bool rewritten;			/* false: the NAL was copied unchanged (IDR, dependent slice) */
+	bool rewritten;			/* false: the header was kept (IDR, dependent slice segment) */
 	uint32_t nal_unit_type;
 	uint32_t temporal_id_plus1;
 	bool no_output_of_prior_pics;
-	/* Sizes of the rewritten header's RPS syntax, in bits. */
+	/* Sizes of the new header's RPS syntax, in bits. */
 	uint32_t short_term_ref_pic_set_size;
 	uint32_t long_term_ref_pic_set_size;
-	/* Size of the rewritten slice segment header up to and including byte_alignment(). */
+	/* Size of the new slice segment header including byte_alignment(), RBSP bytes. */
 	uint32_t header_rbsp_bytes;
-	/* Offset of the slice data in the rewritten (escaped) NAL unit. */
-	uint32_t data_byte_offset;
+	/* Where slice_segment_data() starts in the input NAL unit (escaped bytes). */
+	uint32_t src_data_offset;
 };
 
 enum hevc_rps_error {
@@ -120,20 +126,22 @@ enum hevc_rps_error {
 };
 
 /*
- * Rewrite one slice segment NAL unit (starting at the 2-byte NAL unit
- * header, no start code, emulation prevention bytes included).
- * out_cap should be at least nal_size + 64 + nal_size / 64.
- * ps describes the original SPS/PPS; the output is valid for the same PPS
- * combined with an SPS whose num_short_term_ref_pic_sets and
+ * Rewrite the slice segment header of one slice segment NAL unit (starting
+ * at the 2-byte NAL unit header, no start code, emulation prevention bytes
+ * included). The new header, NAL unit header included and escaped, is
+ * written to out (out_cap >= HEVC_RPS_OUT_SIZE is always enough); the
+ * rewritten NAL unit is out[0 .. *out_size) followed by
+ * nal[res->src_data_offset .. nal_size), so the slice data is never copied
+ * here. ps describes the original SPS/PPS; the result is valid with the
+ * same PPS and an SPS whose num_short_term_ref_pic_sets and
  * num_long_term_ref_pics_sps are 0.
- * Returns HEVC_RPS_OK and the size written in *out_size, or a negative
- * enum hevc_rps_error.
+ * Returns HEVC_RPS_OK or a negative enum hevc_rps_error.
  */
-int hevc_rps_rewrite_slice(const struct hevc_rps_ps *ps,
-			   const struct hevc_rps_set *rps,
-			   const uint8_t *nal, size_t nal_size,
-			   uint8_t *out, size_t out_cap, size_t *out_size,
-			   struct hevc_rps_result *res);
+int hevc_rps_rewrite_header(const struct hevc_rps_ps *ps,
+			    const struct hevc_rps_set *rps,
+			    const uint8_t *nal, size_t nal_size,
+			    uint8_t *out, size_t out_cap, size_t *out_size,
+			    struct hevc_rps_result *res);
 
 const char *hevc_rps_strerror(int err);
 

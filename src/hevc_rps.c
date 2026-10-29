@@ -127,12 +127,14 @@ static unsigned int ceil_log2(uint32_t v)
 
 /* --- emulation prevention (7.4.2) --- */
 
-static size_t unescape(const uint8_t *src, size_t n, uint8_t *dst)
+/* Unescape up to cap RBSP bytes from the start of src. */
+static size_t unescape_prefix(const uint8_t *src, size_t n, uint8_t *dst,
+			      size_t cap, size_t *consumed)
 {
-	size_t o = 0;
+	size_t o = 0, i;
 	unsigned int zeros = 0;
 
-	for (size_t i = 0; i < n; i++) {
+	for (i = 0; i < n && o < cap; i++) {
 		if (zeros >= 2 && src[i] == 0x03) {
 			zeros = 0;
 			continue;
@@ -140,16 +142,33 @@ static size_t unescape(const uint8_t *src, size_t n, uint8_t *dst)
 		dst[o++] = src[i];
 		zeros = src[i] ? 0 : zeros + 1;
 	}
+	*consumed = i;
 	return o;
 }
 
-/* Returns the escaped size, or 0 when out of space. *mark is translated in place. */
-static size_t escape(const uint8_t *src, size_t n, uint8_t *dst, size_t cap,
-		     uint32_t *mark)
+/* Offset in the escaped src of RBSP byte rbsp_pos. */
+static size_t escaped_offset(const uint8_t *src, size_t n, size_t rbsp_pos)
+{
+	size_t o = 0, i;
+	unsigned int zeros = 0;
+
+	for (i = 0; i < n && o < rbsp_pos; i++) {
+		if (zeros >= 2 && src[i] == 0x03) {
+			zeros = 0;
+			continue;
+		}
+		zeros = src[i] ? 0 : zeros + 1;
+		o++;
+	}
+	/* an emulation prevention byte right at rbsp_pos belongs to the data */
+	return i;
+}
+
+/* Escape a slice segment header (its last byte is never zero). Returns 0 when out of space. */
+static size_t escape(const uint8_t *src, size_t n, uint8_t *dst, size_t cap)
 {
 	size_t o = 0;
 	unsigned int zeros = 0;
-	uint32_t m = *mark;
 
 	for (size_t i = 0; i < n; i++) {
 		if (zeros >= 2 && src[i] <= 0x03) {
@@ -158,21 +177,11 @@ static size_t escape(const uint8_t *src, size_t n, uint8_t *dst, size_t cap,
 			dst[o++] = 0x03;
 			zeros = 0;
 		}
-		if (i == m)
-			*mark = (uint32_t)o;
 		if (o >= cap)
 			return 0;
 		dst[o++] = src[i];
 		zeros = src[i] ? 0 : zeros + 1;
 	}
-	/* 7.4.2: a final 0x00 (cabac_zero_word) is followed by 0x03. */
-	if (n && src[n - 1] == 0x00) {
-		if (o >= cap)
-			return 0;
-		dst[o++] = 0x03;
-	}
-	if (m >= n)
-		*mark = (uint32_t)o;
 	return o;
 }
 
@@ -552,13 +561,14 @@ static int cmp_st(const void *a, const void *b)
 	return (x->delta_poc > y->delta_poc) - (x->delta_poc < y->delta_poc);
 }
 
-int hevc_rps_rewrite_slice(const struct hevc_rps_ps *ps,
-			   const struct hevc_rps_set *rps,
-			   const uint8_t *nal, size_t nal_size,
-			   uint8_t *out, size_t out_cap, size_t *out_size,
-			   struct hevc_rps_result *res)
+int hevc_rps_rewrite_header(const struct hevc_rps_ps *ps,
+			    const struct hevc_rps_set *rps,
+			    const uint8_t *nal, size_t nal_size,
+			    uint8_t *out, size_t out_cap, size_t *out_size,
+			    struct hevc_rps_result *res)
 {
-	uint8_t *rbsp = NULL, *nrbsp = NULL;
+	uint8_t rbsp[HEVC_RPS_MAX_HEADER];
+	uint8_t nrbsp[HEVC_RPS_MAX_HEADER + HEVC_RPS_HEADER_GROWTH];
 	struct hdr h;
 	struct rd r;
 	struct wr w;
@@ -567,8 +577,7 @@ int hevc_rps_rewrite_slice(const struct hevc_rps_ps *ps,
 	uint32_t lt_lsb[HEVC_RPS_MAX_LT], lt_cycle[HEVC_RPS_MAX_LT] = { 0 };
 	bool lt_used[HEVC_RPS_MAX_LT], lt_msb[HEVC_RPS_MAX_LT];
 	int num_lt = 0;
-	size_t rbsp_size, nrbsp_cap, nsize, st_start, lt_start;
-	uint32_t mark;
+	size_t rbsp_size, consumed, st_start, lt_start;
 	int ret;
 
 	memset(res, 0, sizeof(*res));
@@ -576,48 +585,26 @@ int hevc_rps_rewrite_slice(const struct hevc_rps_ps *ps,
 	if (nal_size < 3 || rps->num_st > HEVC_RPS_MAX_ST || rps->num_lt > HEVC_RPS_MAX_LT)
 		return HEVC_RPS_ERR_RANGE;
 
-	rbsp = malloc(nal_size);
-	if (!rbsp)
-		return HEVC_RPS_ERR_SPACE;
-	rbsp_size = unescape(nal, nal_size, rbsp);
-
+	/* Only the slice segment header is looked at; it is at most a few hundred bytes. */
+	rbsp_size = unescape_prefix(nal, nal_size, rbsp, sizeof(rbsp), &consumed);
 	r = (struct rd){ .p = rbsp, .bits = rbsp_size * 8 };
 	ret = parse_header(&r, ps, rps, &h);
 	if (ret)
-		goto out;
+		return ret;
 
 	res->nal_unit_type = h.nal_unit_type;
 	res->temporal_id_plus1 = h.temporal_id_plus1;
 	res->no_output_of_prior_pics = h.no_output_of_prior_pics;
+	res->src_data_offset = (uint32_t)escaped_offset(nal, nal_size, h.data_byte);
 
 	if (h.idr || h.dependent) {
-		/* No RPS syntax in this slice segment header: pass it through. */
-		if (nal_size > out_cap) {
-			ret = HEVC_RPS_ERR_SPACE;
-			goto out;
-		}
-		memcpy(out, nal, nal_size);
-		*out_size = nal_size;
+		/* No RPS syntax in this slice segment header: keep it. */
+		if (res->src_data_offset > out_cap)
+			return HEVC_RPS_ERR_SPACE;
+		memcpy(out, nal, res->src_data_offset);
+		*out_size = res->src_data_offset;
 		res->header_rbsp_bytes = (uint32_t)h.data_byte;
-		mark = (uint32_t)h.data_byte;
-		/* Translate the RBSP data offset into the escaped NAL. */
-		{
-			unsigned int zeros = 0;
-			size_t i, o = 0;
-
-			for (i = 0; i < nal_size && o < h.data_byte; i++) {
-				if (zeros >= 2 && nal[i] == 0x03) {
-					zeros = 0;
-					continue;
-				}
-				zeros = nal[i] ? 0 : zeros + 1;
-				o++;
-			}
-			mark = (uint32_t)i;
-		}
-		res->data_byte_offset = mark;
-		ret = HEVC_RPS_OK;
-		goto out;
+		return HEVC_RPS_OK;
 	}
 
 	/* Short-term set, 7.4.8: S0 by decreasing POC, S1 by increasing POC. */
@@ -628,30 +615,19 @@ int hevc_rps_rewrite_slice(const struct hevc_rps_ps *ps,
 			num_neg++;
 		else if (st[i].delta_poc > 0)
 			num_pos++;
-		else {
-			ret = HEVC_RPS_ERR_RANGE;
-			goto out;
-		}
+		else
+			return HEVC_RPS_ERR_RANGE;
 	}
 
 	if (ps->long_term_ref_pics_present) {
 		num_lt = rebuild_lt(ps, rps, &h, lt_lsb, lt_used, lt_msb, lt_cycle);
-		if (num_lt < 0) {
-			ret = num_lt;
-			goto out;
-		}
+		if (num_lt < 0)
+			return num_lt;
 	} else if (rps->num_lt) {
-		ret = HEVC_RPS_ERR_LT_MATCH;
-		goto out;
+		return HEVC_RPS_ERR_LT_MATCH;
 	}
 
-	nrbsp_cap = rbsp_size + 64 + (HEVC_RPS_MAX_ST + HEVC_RPS_MAX_LT) * 8;
-	nrbsp = calloc(1, nrbsp_cap);
-	if (!nrbsp) {
-		ret = HEVC_RPS_ERR_SPACE;
-		goto out;
-	}
-	w = (struct wr){ .p = nrbsp, .cap_bits = nrbsp_cap * 8 };
+	w = (struct wr){ .p = nrbsp, .cap_bits = sizeof(nrbsp) * 8 };
 
 	wr_copy(&w, &r, 0, h.rps_start);
 	wr_bit(&w, 0);					/* short_term_ref_pic_set_sps_flag */
@@ -694,33 +670,20 @@ int hevc_rps_rewrite_slice(const struct hevc_rps_ps *ps,
 	wr_bit(&w, 1);					/* alignment_bit_equal_to_one */
 	while (w.pos & 7)
 		wr_bit(&w, 0);				/* alignment_bit_equal_to_zero */
-	if (w.err) {
-		ret = HEVC_RPS_ERR_SPACE;
-		goto out;
-	}
+	if (w.err)
+		return HEVC_RPS_ERR_SPACE;
 	res->header_rbsp_bytes = (uint32_t)(w.pos >> 3);
 
-	nsize = w.pos >> 3;
-	if (nsize + (rbsp_size - h.data_byte) > nrbsp_cap) {
-		ret = HEVC_RPS_ERR_SPACE;
-		goto out;
-	}
-	memcpy(nrbsp + nsize, rbsp + h.data_byte, rbsp_size - h.data_byte);
-	nsize += rbsp_size - h.data_byte;
-
-	mark = res->header_rbsp_bytes;
-	*out_size = escape(nrbsp, nsize, out, out_cap, &mark);
-	if (!*out_size) {
-		ret = HEVC_RPS_ERR_SPACE;
-		goto out;
-	}
-	res->data_byte_offset = mark;
+	/*
+	 * The last header byte holds alignment_bit_equal_to_one, so it is not
+	 * zero and no emulation prevention sequence can span the end of the
+	 * header: the original escaped slice data stays valid as it is.
+	 */
+	*out_size = escape(nrbsp, res->header_rbsp_bytes, out, out_cap);
+	if (!*out_size)
+		return HEVC_RPS_ERR_SPACE;
 	res->rewritten = true;
-	ret = HEVC_RPS_OK;
-out:
-	free(rbsp);
-	free(nrbsp);
-	return ret;
+	return HEVC_RPS_OK;
 }
 
 const char *hevc_rps_strerror(int err)
