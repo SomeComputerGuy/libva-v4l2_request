@@ -660,6 +660,7 @@ VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
  * layout rules of the FFmpeg v4l2-request hwcontext.
  */
 static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
+				      const struct v4l2r_surface *surface,
 				      uint32_t flags,
 				      VADRMPRIMESurfaceDescriptor *desc)
 {
@@ -676,8 +677,15 @@ static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
 
 	memset(desc, 0, sizeof(*desc));
 	desc->fourcc = info->drm_format;
-	desc->width = width;
-	desc->height = height;
+	/*
+	 * Report the size the surface was created with, like other VA drivers
+	 * do: decoders often pad the buffer height (rkvdec aligns it to 64
+	 * lines, 2176 for 2160p) and consumers that size the imported image
+	 * from the descriptor would otherwise show the padding. The plane
+	 * offsets below still use the real buffer layout.
+	 */
+	desc->width = surface->width && surface->width < width ? surface->width : width;
+	desc->height = surface->height && surface->height < height ? surface->height : height;
 	desc->num_objects = view->nb_planes;
 
 	for (unsigned int i = 0; i < view->nb_planes; i++) {
@@ -787,7 +795,7 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	return fill_prime_descriptor(&view, flags, descriptor);
+	return fill_prime_descriptor(&view, surface, flags, descriptor);
 }
 
 /* --- unsupported display path --- */
