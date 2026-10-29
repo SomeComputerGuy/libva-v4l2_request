@@ -102,6 +102,9 @@ struct v4l2r_decoder {
 	 * device can do 10-bit (e.g. Allwinner A64 lacks it), and the kernel only
 	 * rejects it at decode time, so probe it up front and gate Main10. */
 	bool hevc_10bit;
+	/* Whether a 10-bit stream decodes to a format VA can describe (P010),
+	 * rather than only a decoder-specific one (Rockchip NV15). */
+	bool hevc_10bit_va_output;
 };
 
 /*

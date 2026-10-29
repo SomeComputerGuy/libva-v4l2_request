@@ -253,7 +253,8 @@ static int devnode_from_devnum(uint32_t major, uint32_t minor, char *path,
  * size exceeds the current OUTPUT format — so the SPS is sized to the dimensions
  * the device just accepted for the coded format.
  */
-static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type)
+static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type,
+					  bool *va_output)
 {
 #if HAVE_V4L2_CTRL_HEVC
 	bool mplane = V4L2_TYPE_IS_MULTIPLANAR(output_type);
@@ -301,10 +302,31 @@ static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type)
 		sps.pic_height_in_luma_samples = format.fmt.pix.height;
 	}
 
-	return ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) == 0;
+	if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) < 0)
+		return false;
+
+	/* With the 10-bit SPS set, the CAPTURE queue lists the 10-bit formats. */
+	*va_output = false;
+	{
+		struct v4l2_fmtdesc fmtdesc = {
+			.type = mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
+					 V4L2_BUF_TYPE_VIDEO_CAPTURE,
+		};
+
+		while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
+			const struct v4l2r_format_info *info =
+				v4l2r_format_by_pixelformat(fmtdesc.pixelformat);
+
+			if (info && info->bit_depth == 10 && info->va_fourcc)
+				*va_output = true;
+			fmtdesc.index++;
+		}
+	}
+	return true;
 #else
 	(void)fd;
 	(void)output_type;
+	(void)va_output;
 	return false;
 #endif
 }
@@ -397,7 +419,8 @@ static bool video_device_is_request_decoder(const char *path,
 	for (unsigned int i = 0; i < decoder->nb_pixelformats; i++) {
 		if (decoder->pixelformats[i] == V4L2_PIX_FMT_HEVC_SLICE) {
 			decoder->hevc_10bit =
-				video_device_probe_hevc_10bit(fd, output_type);
+				video_device_probe_hevc_10bit(fd, output_type,
+							      &decoder->hevc_10bit_va_output);
 			break;
 		}
 	}
@@ -676,6 +699,25 @@ static bool driver_supports_hevc_10bit(struct v4l2r_driver *drv)
 }
 
 /*
+ * Whether 10-bit frames can be handed out at all: either a decoder writes a
+ * format VA can describe (P010), or the converter turns the decoder-only
+ * format (Rockchip NV15) into NV12. Otherwise advertising Main10 or VP9
+ * Profile 2 makes clients pick hardware decoding that fails on the first
+ * frame, and Chromium reports resolutions it cannot play. The HEVC probe
+ * stands in for VP9 Profile 2, which uses the same CAPTURE formats on the
+ * decoders we know (rkvdec).
+ */
+static bool driver_has_10bit_output(struct v4l2r_driver *drv)
+{
+	for (unsigned int i = 0; i < drv->nb_decoders; i++) {
+		if (drv->decoders[i].hevc_10bit_va_output)
+			return true;
+	}
+
+	return v4l2r_converter_available(drv);
+}
+
+/*
  * Whether a decode profile is usable: some decoder must accept the codec's
  * coded format, and for 10-bit profiles the hardware must actually support the
  * higher bit depth (advertising Main10 on an 8-bit-only decoder would make
@@ -689,6 +731,10 @@ static bool driver_supports_profile(struct v4l2r_driver *drv, VAProfile profile)
 		return false;
 
 	if (profile == VAProfileHEVCMain10 && !driver_supports_hevc_10bit(drv))
+		return false;
+
+	if ((profile == VAProfileHEVCMain10 || profile == VAProfileVP9Profile2) &&
+	    !driver_has_10bit_output(drv))
 		return false;
 
 	return true;
