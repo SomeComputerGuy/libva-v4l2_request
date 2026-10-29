@@ -1,2 +1,4 @@
 option('driverdir', type: 'string', value: '',
        description: 'libva driver installation directory (defaults to the libva pkg-config driverdir)')
+option('hevc_conformance_dir', type: 'string', value: '',
+       description: 'Directory with the unpacked JCT-VC HEVC_v1 conformance vectors (fluster layout) for the hevc_rps test')
