@@ -93,6 +93,8 @@ struct v4l2r_decoder {
 	char video_path[256];
 	char card[32];
 	uint32_t pixelformats[V4L2R_MAX_PIXELFORMATS];
+	/* Largest coded size (width * height) per pixelformat, 0 if unknown. */
+	uint64_t max_area[V4L2R_MAX_PIXELFORMATS];
 	unsigned int nb_pixelformats;
 	/* Whether this decoder accepts a 10-bit HEVC SPS. Not every HEVC-capable
 	 * device can do 10-bit (e.g. Allwinner A64 lacks it), and the kernel only

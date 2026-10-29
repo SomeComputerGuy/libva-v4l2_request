@@ -352,6 +352,28 @@ static bool video_device_is_request_decoder(const char *path,
 	fmtdesc.type = output_type;
 	while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0 &&
 	       decoder->nb_pixelformats < V4L2R_MAX_PIXELFORMATS) {
+		struct v4l2_frmsizeenum frmsize = {
+			.pixel_format = fmtdesc.pixelformat,
+		};
+		uint64_t area = 0;
+
+		/* Remember the largest coded size, to prefer the most capable
+		 * decoder when several take the same codec (e.g. RK3588 rkvdec
+		 * and Hantro G1 for H.264). */
+		while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) >= 0) {
+			uint64_t a = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ?
+				(uint64_t)frmsize.discrete.width * frmsize.discrete.height :
+				(uint64_t)frmsize.stepwise.max_width *
+				frmsize.stepwise.max_height;
+
+			if (a > area)
+				area = a;
+			if (frmsize.type != V4L2_FRMSIZE_TYPE_DISCRETE)
+				break;
+			frmsize.index++;
+		}
+
+		decoder->max_area[decoder->nb_pixelformats] = area;
 		decoder->pixelformats[decoder->nb_pixelformats++] =
 			fmtdesc.pixelformat;
 		fmtdesc.index++;

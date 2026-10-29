@@ -671,6 +671,32 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 
 /* --- VA entrypoints --- */
 
+static uint64_t decoder_max_area(const struct v4l2r_decoder *decoder,
+				 uint32_t pixelformat)
+{
+	for (unsigned int i = 0; i < decoder->nb_pixelformats; i++)
+		if (decoder->pixelformats[i] == pixelformat)
+			return decoder->max_area[i];
+	return 0;
+}
+
+/* Decoder indices, largest maximum coded size for pixelformat first (stable). */
+static void sort_decoders(const struct v4l2r_driver *drv, uint32_t pixelformat,
+			  unsigned int order[V4L2R_MAX_DECODERS])
+{
+	for (unsigned int i = 0; i < drv->nb_decoders; i++) {
+		unsigned int j = i;
+		uint64_t area = decoder_max_area(&drv->decoders[i], pixelformat);
+
+		while (j > 0 &&
+		       decoder_max_area(&drv->decoders[order[j - 1]], pixelformat) < area) {
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = i;
+	}
+}
+
 VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 			     int picture_width, int picture_height, int flag,
 			     VASurfaceID *render_targets, int num_render_targets,
@@ -678,6 +704,7 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 	const struct v4l2r_decoder *decoder = NULL;
+	unsigned int order[V4L2R_MAX_DECODERS];
 	struct v4l2r_config *config;
 	struct v4l2r_context *ctx;
 	struct v4l2_capability capability = {0};
@@ -732,11 +759,13 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 		}
 	}
 
-	/* Find a decoder that takes this codec and open it. Probing stops at
-	 * the first device where the whole OUTPUT setup succeeds. */
+	/* Find a decoder that takes this codec and open it, most capable
+	 * (largest maximum coded size) first. Probing stops at the first device
+	 * where the whole OUTPUT setup succeeds. */
 	status = VA_STATUS_ERROR_OPERATION_FAILED;
-	for (unsigned int i = 0; i < drv->nb_decoders; i++) {
-		decoder = &drv->decoders[i];
+	sort_decoders(drv, ctx->codec->pixelformat, order);
+	for (unsigned int n = 0; n < drv->nb_decoders; n++) {
+		decoder = &drv->decoders[order[n]];
 
 		ctx->video_fd = open(decoder->video_path, O_RDWR | O_NONBLOCK);
 		if (ctx->video_fd < 0)
