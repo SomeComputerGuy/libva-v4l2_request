@@ -11,3 +11,9 @@ if conf_dir != ''
               conf_dir / 'JCT-VC-HEVC_V1.json', conf_dir / 'x'],
        timeout: 3600)
 endif
+
+libva_drm_dep = dependency('libva-drm', required: false)
+if libva_drm_dep.found()
+  executable('vaprobe', 'vaprobe.c', dependencies: [libva_dep, libva_drm_dep],
+             install: false)
+endif
