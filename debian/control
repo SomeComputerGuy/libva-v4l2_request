@@ -1,0 +1,31 @@
+Source: libva-v4l2-request
+Section: video
+Priority: optional
+Maintainer: Arun Iyengar <aiyengar1990@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               meson (>= 0.60),
+               pkgconf,
+               libva-dev (>= 2.24),
+               libdrm-dev,
+               linux-libc-dev (>= 7.0)
+Standards-Version: 4.7.2
+Homepage: https://xff.cz/git/libva-v4l2_request
+Rules-Requires-Root: no
+
+Package: v4l2-request-va-driver
+Architecture: linux-any
+Multi-Arch: same
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Enhances: libva2
+Provides: va-driver
+Description: VA-API driver for V4L2 stateless (Request API) video decoders
+ A libva backend that drives the Linux V4L2 stateless decoder interface
+ (Media Request API), as found on Rockchip (rkvdec, Hantro, AV1 VPU),
+ Allwinner (cedrus) and other SoCs whose GPU has no video engine. VA-API
+ applications - Firefox, Chromium, mpv, FFmpeg, GStreamer va - can then use
+ the hardware decoders for MPEG-2, H.264, HEVC, VP8, VP9 and AV1, with
+ decoded frames exported as dma-bufs (no copies).
+ .
+ The package also installs panthor_drv_video.so and panfrost_drv_video.so
+ links, so that libva picks this driver for the Arm Mali render nodes
+ (which have no video engine) without LIBVA_DRIVER_NAME.

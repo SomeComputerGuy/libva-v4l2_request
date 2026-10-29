@@ -1,0 +1,2 @@
+usr/lib/${DEB_HOST_MULTIARCH}/dri/v4l2_request_drv_video.so usr/lib/${DEB_HOST_MULTIARCH}/dri/panthor_drv_video.so
+usr/lib/${DEB_HOST_MULTIARCH}/dri/v4l2_request_drv_video.so usr/lib/${DEB_HOST_MULTIARCH}/dri/panfrost_drv_video.so
