@@ -19,6 +19,7 @@
 
 #include "v4l2_request.h"
 #include "bits.h"
+#include "hevc_rps.h"
 
 #if HAVE_V4L2_CTRL_HEVC
 
@@ -83,6 +84,18 @@ struct hevc_context {
 
 	bool first_slice;
 	unsigned int num_slices;
+
+	/*
+	 * The decoder parses slice headers itself and wants the SPS RPS tables
+	 * (EXT_SPS_ST/LT_RPS), which VA-API does not carry: rewrite each slice
+	 * header to code its RPS explicitly instead (see hevc_rps.h).
+	 */
+	bool normalize_rps;
+	struct hevc_rps_set rps_set;
+	VASliceParameterBufferHEVC va_slice_tmp;
+	uint8_t *scratch;
+	size_t scratch_size;
+	unsigned int rps_errors;
 };
 
 static unsigned int ceil_log2(unsigned int value)
@@ -441,6 +454,12 @@ static void hevc_fill_sps_pps(struct v4l2r_context *ctx,
 		.chroma_format_idc = pic->pic_fields.bits.chroma_format_idc,
 	};
 
+	/* Slice headers are rewritten to carry their RPS explicitly. */
+	if (codec->normalize_rps) {
+		sps->num_short_term_ref_pic_sets = 0;
+		sps->num_long_term_ref_pics_sps = 0;
+	}
+
 	if (pic->pic_fields.bits.separate_colour_plane_flag)
 		sps->flags |= V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE;
 	if (pic->pic_fields.bits.scaling_list_enabled_flag)
@@ -578,6 +597,32 @@ static void hevc_fill_decode_params(struct v4l2r_context *ctx,
 	}
 
 	decode->num_active_dpb_entries = entries;
+
+	/* The current picture's RPS as VA-API describes it, for hevc_rps_rewrite_slice(). */
+	memset(&codec->rps_set, 0, sizeof(codec->rps_set));
+	codec->rps_set.poc = pic->CurrPic.pic_order_cnt;
+	for (int i = 0; i < 15; i++) {
+		const VAPictureHEVC *ref = &pic->ReferenceFrames[i];
+		struct hevc_rps_set *set = &codec->rps_set;
+
+		if (codec->dpb_index_of_va[i] == 0xff)
+			continue;
+		if (ref->flags & VA_PICTURE_HEVC_LONG_TERM_REFERENCE) {
+			if (set->num_lt >= HEVC_RPS_MAX_LT)
+				continue;
+			set->lt[set->num_lt].poc = ref->pic_order_cnt;
+			set->lt[set->num_lt++].used =
+				!!(ref->flags & VA_PICTURE_HEVC_RPS_LT_CURR);
+		} else {
+			if (set->num_st >= HEVC_RPS_MAX_ST)
+				continue;
+			set->st[set->num_st].delta_poc =
+				ref->pic_order_cnt - pic->CurrPic.pic_order_cnt;
+			set->st[set->num_st++].used =
+				!!(ref->flags & (VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE |
+						 VA_PICTURE_HEVC_RPS_ST_CURR_AFTER));
+		}
+	}
 
 	/*
 	 * Rebuild the RPS current lists from the VA reference flags:
@@ -763,6 +808,114 @@ static void hevc_fill_slice_params(struct v4l2r_context *ctx,
 	hevc_fill_pred_weights(&params->pred_weight_table, slice);
 }
 
+/* --- RPS normalisation --- */
+
+static void hevc_fill_rps_ps(const VAPictureParameterBufferHEVC *pic,
+			     struct hevc_rps_ps *ps)
+{
+	unsigned int ctb_log2 = pic->log2_min_luma_coding_block_size_minus3 + 3 +
+				pic->log2_diff_max_min_luma_coding_block_size;
+	unsigned int ctb = 1u << ctb_log2;
+
+	*ps = (struct hevc_rps_ps) {
+		.pic_size_in_ctbs_y =
+			((pic->pic_width_in_luma_samples + ctb - 1) >> ctb_log2) *
+			((pic->pic_height_in_luma_samples + ctb - 1) >> ctb_log2),
+		.log2_max_poc_lsb = pic->log2_max_pic_order_cnt_lsb_minus4 + 4,
+		.num_extra_slice_header_bits = pic->num_extra_slice_header_bits,
+		.chroma_array_type = pic->pic_fields.bits.separate_colour_plane_flag ?
+				     0 : pic->pic_fields.bits.chroma_format_idc,
+		.num_short_term_ref_pic_sets = pic->num_short_term_ref_pic_sets,
+		.num_long_term_ref_pics_sps = pic->num_long_term_ref_pic_sps,
+		.num_ref_idx_l0_default_active_minus1 =
+			pic->num_ref_idx_l0_default_active_minus1,
+		.num_ref_idx_l1_default_active_minus1 =
+			pic->num_ref_idx_l1_default_active_minus1,
+		.st_rps_bits = pic->st_rps_bits,
+		.st_rps_bits_valid = true,
+		.dependent_slice_segments_enabled =
+			pic->slice_parsing_fields.bits.dependent_slice_segments_enabled_flag,
+		.output_flag_present = pic->slice_parsing_fields.bits.output_flag_present_flag,
+		.separate_colour_plane = pic->pic_fields.bits.separate_colour_plane_flag,
+		.long_term_ref_pics_present =
+			pic->slice_parsing_fields.bits.long_term_ref_pics_present_flag,
+		.sps_temporal_mvp_enabled =
+			pic->slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag,
+		.sample_adaptive_offset_enabled =
+			pic->slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag,
+		.lists_modification_present =
+			pic->slice_parsing_fields.bits.lists_modification_present_flag,
+		.cabac_init_present = pic->slice_parsing_fields.bits.cabac_init_present_flag,
+		.weighted_pred = pic->pic_fields.bits.weighted_pred_flag,
+		.weighted_bipred = pic->pic_fields.bits.weighted_bipred_flag,
+		.pps_slice_chroma_qp_offsets_present =
+			pic->slice_parsing_fields.bits.pps_slice_chroma_qp_offsets_present_flag,
+		/* Range extension (chroma_qp_offset_list_enabled_flag) is not supported. */
+		.chroma_qp_offset_list_enabled = false,
+		.deblocking_filter_override_enabled =
+			pic->slice_parsing_fields.bits.deblocking_filter_override_enabled_flag,
+		.pps_deblocking_filter_disabled =
+			pic->slice_parsing_fields.bits.pps_disable_deblocking_filter_flag,
+		.pps_loop_filter_across_slices_enabled =
+			pic->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag,
+		.tiles_enabled = pic->pic_fields.bits.tiles_enabled_flag,
+		.entropy_coding_sync_enabled = pic->pic_fields.bits.entropy_coding_sync_enabled_flag,
+		.slice_segment_header_extension_present =
+			pic->slice_parsing_fields.bits.slice_segment_header_extension_present_flag,
+	};
+}
+
+/*
+ * Rewrite one slice NAL unit to carry its RPS explicitly. On success
+ * out and out_size describe the rewritten NAL in codec->scratch and info is
+ * updated with the sizes of the new header's RPS syntax.
+ */
+static VAStatus hevc_normalize_slice(struct hevc_context *codec,
+				     const uint8_t *data, size_t size,
+				     struct hevc_slice_info *info,
+				     const uint8_t **out, size_t *out_size,
+				     uint32_t *data_byte_offset)
+{
+	size_t need = size + 64 + size / 64 + (HEVC_RPS_MAX_ST + HEVC_RPS_MAX_LT) * 8;
+	struct hevc_rps_result res;
+	struct hevc_rps_ps ps;
+	int ret;
+
+	if (codec->scratch_size < need) {
+		uint8_t *p = realloc(codec->scratch, need);
+
+		if (!p)
+			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+		codec->scratch = p;
+		codec->scratch_size = need;
+	}
+
+	hevc_fill_rps_ps(&codec->va_pic, &ps);
+	codec->rps_set.num_pic_total_curr = codec->num_pic_total_curr;
+
+	ret = hevc_rps_rewrite_slice(&ps, &codec->rps_set, data, size,
+				     codec->scratch, codec->scratch_size,
+				     out_size, &res);
+	if (ret) {
+		if (codec->rps_errors++ < 10)
+			v4l2r_log("hevc: cannot rewrite slice header of POC %d: %s\n",
+				  codec->rps_set.poc, hevc_rps_strerror(ret));
+		return VA_STATUS_ERROR_DECODING_ERROR;
+	}
+
+	*out = codec->scratch;
+	*data_byte_offset = res.data_byte_offset;
+	info->nal_unit_type = res.nal_unit_type;
+	info->temporal_id_plus1 = res.temporal_id_plus1;
+	info->no_output_of_prior_pics = res.no_output_of_prior_pics;
+	if (res.rewritten) {
+		info->short_term_ref_pic_set_size = res.short_term_ref_pic_set_size;
+		info->long_term_ref_pic_set_size = res.long_term_ref_pic_set_size;
+		info->num_delta_pocs_of_ref_rps_idx = 0;
+	}
+	return VA_STATUS_SUCCESS;
+}
+
 /* --- submission --- */
 
 static VAStatus hevc_submit(struct v4l2r_context *ctx, bool last_slice)
@@ -864,6 +1017,25 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 	hevc_parse_slice_header(codec, slice_data, va_slice->slice_data_size,
 				&info);
 
+	if (codec->normalize_rps) {
+		VASliceParameterBufferHEVC *s = &codec->va_slice_tmp;
+		uint32_t data_byte_offset;
+		size_t size;
+
+		status = hevc_normalize_slice(codec, slice_data,
+					      va_slice->slice_data_size, &info,
+					      &slice_data, &size, &data_byte_offset);
+		if (status != VA_STATUS_SUCCESS)
+			return status;
+
+		/* The slice params below describe the rewritten NAL unit. */
+		*s = *va_slice;
+		s->slice_data_offset = 0;
+		s->slice_data_size = size;
+		s->slice_data_byte_offset = data_byte_offset;
+		va_slice = s;
+	}
+
 	if (codec->num_slices == 0 && info.valid) {
 		codec->decode_params.short_term_ref_pic_set_size =
 			info.short_term_ref_pic_set_size;
@@ -926,22 +1098,19 @@ static VAStatus hevc_init(struct v4l2r_context *ctx)
 	int ret;
 
 	/*
-	 * Some decoders (Rockchip rkvdec2 / vdpu38x on e.g. RK3588) decode HEVC
-	 * fully statelessly and require the complete SPS short-term reference
-	 * picture set table via V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS; without
-	 * it they silently emit corrupted inter frames. That table is the raw
-	 * SPS st_ref_pic_set() syntax, which VA-API never exposes (the picture
-	 * parameter buffer only carries the set count) and which cannot be
-	 * reconstructed from the per-frame data we do get. If the decoder
-	 * advertises that control we cannot drive it correctly, so decline HEVC
-	 * here and let the caller fall back (to software, or to another decoder
-	 * once codec-to-device assignment is prioritised).
+	 * Some decoders (Rockchip VDPU381/VDPU383 on RK3588/RK3576) parse the
+	 * slice segment header in hardware and resolve
+	 * short_term_ref_pic_set_idx / lt_idx_sps through tables built from
+	 * the SPS st_ref_pic_set() syntax
+	 * (V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS / _LT_RPS). VA-API never
+	 * passes that syntax, only the RPS of the current picture, so rewrite
+	 * each slice header to code its RPS explicitly and tell the decoder the
+	 * SPS has no RPS candidates (see hevc_rps.h).
 	 */
-	if (!v4l2r_query_control(ctx, &ext_sps_st_rps)) {
-		v4l2r_log("hevc: decoder requires SPS RPS tables (EXT_SPS_ST_RPS) "
-			  "that VA-API cannot supply; declining HEVC\n");
-		return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
-	}
+	codec->normalize_rps = !v4l2r_query_control(ctx, &ext_sps_st_rps);
+	if (codec->normalize_rps)
+		v4l2r_log("hevc: decoder parses slice headers with SPS RPS tables; "
+			  "rewriting slice headers to explicit RPS\n");
 
 	ret = v4l2r_query_control_default(ctx,
 			V4L2_CID_STATELESS_HEVC_DECODE_MODE, &codec->decode_mode);
@@ -1002,6 +1171,7 @@ static void hevc_uninit(struct v4l2r_context *ctx)
 	free(codec->slice_params);
 	free(codec->va_slices);
 	free(codec->entry_point_offsets);
+	free(codec->scratch);
 	codec->slice_params = NULL;
 	codec->va_slices = NULL;
 	codec->entry_point_offsets = NULL;
