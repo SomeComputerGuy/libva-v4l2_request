@@ -1,3 +1,10 @@
+libva-v4l2-request (1.2+opi5.2-1) unstable; urgency=medium
+
+  * Fix a deadlock in vaQueryConfigProfiles() (converter probe took the
+    driver mutex already held by the caller); add tests/locking_test.
+
+ -- Arun Iyengar <aiyengar1990@gmail.com>  Fri, 30 Oct 2026 08:00:00 +0000
+
 libva-v4l2-request (1.2+opi5.1-1) unstable; urgency=medium
 
   * Snapshot of https://xff.cz/git/libva-v4l2_request at cac6ece (1.2) with
