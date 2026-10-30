@@ -17,11 +17,17 @@ sources = [
   'codec_av1.c',
 ]
 
+driver_lib = static_library('v4l2_request_drv',
+                            sources,
+                            include_directories: root_inc,
+                            c_args: ['-fvisibility=hidden'],
+                            dependencies: [libva_dep, libdrm_dep, threads_dep],
+                            pic: true)
+
 shared_module('v4l2_request_drv_video',
-              sources,
+              link_whole: driver_lib,
               name_prefix: '',
               include_directories: root_inc,
-              c_args: ['-fvisibility=hidden'],
               dependencies: [libva_dep, libdrm_dep, threads_dep],
               install: true,
               install_dir: driverdir)

@@ -608,7 +608,7 @@ fail:
 	return false;
 }
 
-/* Called lazily via v4l2r_converter_available(), with drv->mutex held. */
+/* Called lazily via v4l2r_converter_available(), with drv->converter_mutex held. */
 static void enumerate_converters(struct v4l2r_driver *drv)
 {
 	if (getenv("V4L2R_NO_CONVERT"))
@@ -651,14 +651,21 @@ static void enumerate_converters(struct v4l2r_driver *drv)
  */
 bool v4l2r_converter_available(struct v4l2r_driver *drv)
 {
-	pthread_mutex_lock(&drv->mutex);
+	bool available;
+
+	/*
+	 * Not drv->mutex: profile and config queries call this with it held,
+	 * and it is not recursive (that deadlocked vaQueryConfigProfiles).
+	 */
+	pthread_mutex_lock(&drv->converter_mutex);
 	if (!drv->converter_probed) {
 		enumerate_converters(drv);
 		drv->converter_probed = true;
 	}
-	pthread_mutex_unlock(&drv->mutex);
+	available = drv->has_converter;
+	pthread_mutex_unlock(&drv->converter_mutex);
 
-	return drv->has_converter;
+	return available;
 }
 
 bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat)
@@ -990,6 +997,7 @@ VAStatus v4l2r_Terminate(VADriverContextP va_ctx)
 	v4l2r_handles_destroy(&drv->images);
 
 	pthread_mutex_destroy(&drv->mutex);
+	pthread_mutex_destroy(&drv->converter_mutex);
 
 	free(drv);
 	va_ctx->pDriverData = NULL;
@@ -1097,6 +1105,7 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 	}
 
 	pthread_mutex_init(&drv->mutex, NULL);
+	pthread_mutex_init(&drv->converter_mutex, NULL);
 	va_ctx->pDriverData = drv;
 
 	enumerate_decoders(drv);

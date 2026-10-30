@@ -389,7 +389,9 @@ struct v4l2r_driver {
 	unsigned int nb_decoders;
 
 	/* Converter detection is deferred until something can actually use
-	 * one (see v4l2r_converter_available). */
+	 * one (see v4l2r_converter_available). It has its own lock because
+	 * callers may hold drv->mutex (e.g. vaQueryConfigProfiles). */
+	pthread_mutex_t converter_mutex;
 	struct v4l2r_converter converter;
 	bool converter_probed;
 	bool has_converter;

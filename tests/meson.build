@@ -17,3 +17,9 @@ if libva_drm_dep.found()
   executable('vaprobe', 'vaprobe.c', dependencies: [libva_dep, libva_drm_dep],
              install: false)
 endif
+
+locking_test = executable('locking_test', 'locking_test.c',
+                          include_directories: [root_inc, include_directories('../src')],
+                          link_with: driver_lib,
+                          dependencies: [libva_dep, libdrm_dep, threads_dep])
+test('locking', locking_test, timeout: 30)
