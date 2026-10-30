@@ -15,7 +15,7 @@ Rules-Requires-Root: no
 Package: v4l2-request-va-driver
 Architecture: linux-any
 Multi-Arch: same
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}, libva2 (>= 2.24)
 Enhances: libva2
 Provides: va-driver
 Description: VA-API driver for V4L2 stateless (Request API) video decoders
