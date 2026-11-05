@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,6 +45,19 @@ struct av1_context {
 	unsigned int nb_va_slices;
 	unsigned int alloc_va_slices;
 	unsigned int slices_consumed;
+
+	/*
+	 * VA-API does not fix the order of a picture's slice parameter and
+	 * slice data buffers. FFmpeg sends each tile group's parameters before
+	 * its data; Chromium sends the frame's single data buffer first and
+	 * one parameter buffer per tile after it. Parameters that arrive while
+	 * no data buffer is waiting are held until the next one; data that
+	 * arrives with no parameters pending stays "open" (offset and size in
+	 * the OUTPUT buffer) and takes the parameters that follow it.
+	 */
+	bool data_open;
+	uint32_t data_base;
+	uint32_t data_size;
 
 	/*
 	 * One-frame submission deferral. refresh_frame_flags (which DPB slots
@@ -617,6 +631,46 @@ static VAStatus av1_begin_picture(struct v4l2r_context *ctx)
 	codec->num_tiles = 0;
 	codec->nb_va_slices = 0;
 	codec->slices_consumed = 0;
+	codec->data_open = false;
+
+	return VA_STATUS_SUCCESS;
+}
+
+/* Turn the not yet consumed slice parameters into tile entries of the slice
+ * data buffer at [base, base + size) of the OUTPUT buffer. */
+static VAStatus av1_consume_slices(struct av1_context *codec, uint32_t base,
+				   uint32_t size)
+{
+	unsigned int pending = codec->nb_va_slices - codec->slices_consumed;
+
+	if (codec->num_tiles + pending > V4L2_AV1_MAX_TILE_COUNT)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	if (v4l2r_array_reserve((void **)&codec->tiles, &codec->alloc_tiles,
+				codec->num_tiles + pending,
+				sizeof(*codec->tiles)) < 0)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+	while (codec->slices_consumed < codec->nb_va_slices) {
+		const VASliceParameterBufferAV1 *va_slice =
+			&codec->va_slices[codec->slices_consumed];
+
+		if (va_slice->slice_data_offset > size ||
+		    va_slice->slice_data_size >
+		    size - va_slice->slice_data_offset)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
+
+		codec->tiles[codec->num_tiles] =
+			(struct v4l2_ctrl_av1_tile_group_entry) {
+			.tile_offset = base + va_slice->slice_data_offset,
+			.tile_size = va_slice->slice_data_size,
+			.tile_row = va_slice->tile_row,
+			.tile_col = va_slice->tile_column,
+		};
+
+		codec->num_tiles++;
+		codec->slices_consumed++;
+	}
 
 	return VA_STATUS_SUCCESS;
 }
@@ -640,6 +694,11 @@ static VAStatus av1_store_slice_params(struct av1_context *codec,
 	       count * sizeof(*elements));
 	codec->nb_va_slices += count;
 
+	/* Parameters for a data buffer that came first (Chromium). */
+	if (codec->data_open)
+		return av1_consume_slices(codec, codec->data_base,
+					  codec->data_size);
+
 	return VA_STATUS_SUCCESS;
 }
 
@@ -648,40 +707,25 @@ static VAStatus av1_process_tiles(struct v4l2r_context *ctx,
 {
 	struct av1_context *codec = ctx->codec_priv;
 	uint32_t base = ctx->pic.output ? ctx->pic.output->bytesused : 0;
-	unsigned int pending = codec->nb_va_slices - codec->slices_consumed;
+	size_t size = (size_t)buf->element_size * buf->nb_elements;
 	VAStatus status;
 
-	if (codec->num_tiles + pending > V4L2_AV1_MAX_TILE_COUNT)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
+	if (size > UINT32_MAX - base)
+		return VA_STATUS_ERROR_INVALID_BUFFER;
 
-	if (v4l2r_array_reserve((void **)&codec->tiles, &codec->alloc_tiles,
-				codec->num_tiles + pending,
-				sizeof(*codec->tiles)) < 0)
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-
-	while (codec->slices_consumed < codec->nb_va_slices) {
-		const VASliceParameterBufferAV1 *va_slice =
-			&codec->va_slices[codec->slices_consumed];
-
-		codec->tiles[codec->num_tiles] =
-			(struct v4l2_ctrl_av1_tile_group_entry) {
-			.tile_offset = base + va_slice->slice_data_offset,
-			.tile_size = va_slice->slice_data_size,
-			.tile_row = va_slice->tile_row,
-			.tile_col = va_slice->tile_column,
-		};
-
-		codec->num_tiles++;
-		codec->slices_consumed++;
-	}
-
-	status = v4l2r_append_output(ctx, buf->data,
-				     (size_t)buf->element_size *
-				     buf->nb_elements);
+	status = v4l2r_append_output(ctx, buf->data, size);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	return VA_STATUS_SUCCESS;
+	/* Parameters sent ahead of this data (FFmpeg) are for it; without
+	 * any, the parameters that follow are (Chromium). */
+	codec->data_open = codec->slices_consumed == codec->nb_va_slices;
+	codec->data_base = base;
+	codec->data_size = (uint32_t)size;
+	if (codec->data_open)
+		return VA_STATUS_SUCCESS;
+
+	return av1_consume_slices(codec, base, (uint32_t)size);
 }
 
 /*
@@ -758,6 +802,14 @@ static VAStatus av1_submit_pending(struct v4l2r_context *ctx, uint8_t refresh)
 			.size = sizeof(codec->pend_film_grain),
 		};
 	}
+
+	/* The CAPTURE format is chosen on the first decode. AV1 Main does not
+	 * fix the bit depth, so take it from the sequence: the VPU981
+	 * post-processor also offers NV12 for 10-bit streams (as a
+	 * down-conversion), while the client allocated its surfaces for the
+	 * stream's own depth (P010). */
+	if (!ctx->streaming)
+		ctx->bit_depth = codec->pend_sequence.bit_depth;
 
 	codec->pend_valid = false;
 	saved = ctx->pic;

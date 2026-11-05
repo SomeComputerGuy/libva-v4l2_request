@@ -23,3 +23,9 @@ locking_test = executable('locking_test', 'locking_test.c',
                           link_with: driver_lib,
                           dependencies: [libva_dep, libdrm_dep, threads_dep])
 test('locking', locking_test, timeout: 30)
+
+# Includes codec_av1.c itself with the rest of the driver stubbed out.
+av1_tiles_test = executable('av1_tiles_test', 'av1_tiles_test.c',
+                            include_directories: [root_inc, include_directories('../src')],
+                            dependencies: [libva_dep])
+test('av1_tiles', av1_tiles_test, timeout: 30)
