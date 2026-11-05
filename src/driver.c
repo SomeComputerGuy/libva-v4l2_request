@@ -113,12 +113,20 @@ const struct v4l2r_codec *v4l2r_codec_for_profile(VAProfile profile)
 	return NULL;
 }
 
+/*
+ * Bit depth the profile implies, 0 if the stream decides: AV1 Main covers
+ * 8-bit and 10-bit, and the decoder lists the CAPTURE formats of the
+ * sequence's depth once the sequence control is set (Hantro VPU981 offers
+ * P010 then), so the CAPTURE format must not be filtered by a guess.
+ */
 unsigned int v4l2r_profile_bit_depth(VAProfile profile)
 {
 	switch (profile) {
 	case VAProfileHEVCMain10:
 	case VAProfileVP9Profile2:
 		return 10;
+	case VAProfileAV1Profile0:
+		return 0;
 	default:
 		return 8;
 	}
