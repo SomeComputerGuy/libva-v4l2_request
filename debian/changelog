@@ -1,3 +1,15 @@
+libva-v4l2-request (1.2+opi5.4-1) unstable; urgency=medium
+
+  * AV1: accept the slice data buffer ahead of its slice parameters
+    (Chromium's order), so Chrome decodes AV1 in hardware instead of
+    failing the first vaEndPicture and falling back to dav1d.
+  * AV1: take the CAPTURE bit depth from the sequence, so 10-bit streams
+    decode to P010 (matching the client's surfaces), not down-converted NV12.
+  * Restart decode waits interrupted by signals, and log the kernel's buffer
+    state when a wait times out.
+
+ -- Arun Iyengar <aiyengar1990@gmail.com>  Thu, 05 Nov 2026 23:00:00 +0000
+
 libva-v4l2-request (1.2+opi5.3-1) unstable; urgency=medium
 
   * Advertise HEVC Main10 / VP9 Profile 2 only when the format converter
