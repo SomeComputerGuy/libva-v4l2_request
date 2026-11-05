@@ -105,6 +105,8 @@ struct v4l2r_decoder {
 	/* Whether a 10-bit stream decodes to a format VA can describe (P010),
 	 * rather than only a decoder-specific one (Rockchip NV15). */
 	bool hevc_10bit_va_output;
+	/* The decoder-only 10-bit CAPTURE format it writes then (NV15), or 0. */
+	uint32_t hevc_10bit_native_format;
 };
 
 /*
@@ -568,6 +570,8 @@ bool v4l2r_converter_available(struct v4l2r_driver *drv);
 
 /* Whether the detected converter can read this pixelformat. */
 bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat);
+/* Whether the converter reads the 10-bit format some decoder writes. */
+bool v4l2r_converter_handles_10bit(struct v4l2r_driver *drv);
 
 /* Set up the conversion chain for the context's selected CAPTURE format.
  * Called once from the CAPTURE setup path; on failure the context decodes

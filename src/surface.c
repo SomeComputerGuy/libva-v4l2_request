@@ -206,7 +206,8 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
 	i++;
 
 	/*
-	 * With a format converter available, 10-bit configs hand out NV12
+	 * With a format converter that reads the decoder's 10-bit format,
+	 * 10-bit configs hand out NV12
 	 * surfaces (decoders here produce packed NV15, which the converter
 	 * turns into NV12 in hardware; nothing can display NV15 directly).
 	 * Advertising P010 alongside would make FFmpeg pick it as the exact
@@ -214,7 +215,7 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
 	 * path, so it is only offered when no converter exists.
 	 */
 	if ((cfg->rt_format & VA_RT_FORMAT_YUV420_10) &&
-	    !v4l2r_converter_available(drv)) {
+	    !v4l2r_converter_handles_10bit(drv)) {
 		attrib_list[i].type = VASurfaceAttribPixelFormat;
 		attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
 		attrib_list[i].value.type = VAGenericValueTypeInteger;
@@ -481,7 +482,7 @@ static VAStatus backing_alloc_default(struct v4l2r_driver *drv,
 	if (surface->fourcc == VA_FOURCC_P010 ||
 	    (!surface->fourcc &&
 	     (surface->rt_format & VA_RT_FORMAT_YUV420_10) &&
-	     !v4l2r_converter_available(drv)))
+	     !v4l2r_converter_handles_10bit(drv)))
 		pixelformat = V4L2_PIX_FMT_P010;
 
 	return backing_alloc(drv, surface, surface->width, surface->height,
