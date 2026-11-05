@@ -1,3 +1,13 @@
+libva-v4l2-request (1.2+opi5.3-1) unstable; urgency=medium
+
+  * Advertise HEVC Main10 / VP9 Profile 2 only when the format converter
+    reads the decoder's 10-bit format (NV15); the mainline RGA does not, so
+    the profiles were listed and then failed on the first frame.
+  * AV1: let the sequence pick the CAPTURE bit depth, so 10-bit AV1 decodes
+    to P010 through the VPU981 post-processor instead of being refused.
+
+ -- Arun Iyengar <aiyengar1990@gmail.com>  Thu, 05 Nov 2026 21:30:00 +0000
+
 libva-v4l2-request (1.2+opi5.2-1) unstable; urgency=medium
 
   * Fix a deadlock in vaQueryConfigProfiles() (converter probe took the
