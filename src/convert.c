@@ -202,7 +202,7 @@ static int convert_reap(struct v4l2r_context *ctx, bool wait)
 			if (!wait || reaped)
 				break;
 
-			if (poll(&pollfd, 1, V4L2R_CONVERT_TIMEOUT_MS) <= 0)
+			if (v4l2r_poll(&pollfd, V4L2R_CONVERT_TIMEOUT_MS) <= 0)
 				return -EIO;
 			continue;
 		}
@@ -790,7 +790,7 @@ static VAStatus vpp_run(struct v4l2r_vpp *vpp,
 	};
 	while (ioctl(vpp->fd, VIDIOC_DQBUF, &buffer) < 0) {
 		if (errno != EAGAIN ||
-		    poll(&pollfd, 1, V4L2R_CONVERT_TIMEOUT_MS) <= 0)
+		    v4l2r_poll(&pollfd, V4L2R_CONVERT_TIMEOUT_MS) <= 0)
 			return VA_STATUS_ERROR_OPERATION_FAILED;
 	}
 	if (buffer.flags & V4L2_BUF_FLAG_ERROR)

@@ -84,6 +84,11 @@ struct v4l2r_codec;
 void v4l2r_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void v4l2r_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+struct pollfd;
+/* poll() that restarts after a signal (poll is never restarted by SA_RESTART)
+ * with the remaining time; returns > 0 when ready, 0 on timeout, -errno. */
+int v4l2r_poll(struct pollfd *pfd, int timeout_ms);
+
 /*
  * One V4L2 stateless decoder found during device enumeration: the media
  * device it hangs off and the coded (OUTPUT queue) pixelformats it accepts.
@@ -284,7 +289,7 @@ struct v4l2r_context {
 
 	unsigned int picture_width;
 	unsigned int picture_height;
-	unsigned int bit_depth;		/* hint from the VA profile */
+	unsigned int bit_depth;		/* hint from the VA profile (AV1: the sequence) */
 
 	struct v4l2_format output_format;
 	struct v4l2_format capture_format;

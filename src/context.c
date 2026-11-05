@@ -476,7 +476,7 @@ static void capture_wait_readers(struct v4l2r_capture_buffer *capture)
 		if (capture->dmabuf_fd[i] < 0)
 			continue;
 
-		poll(&pfd, 1, V4L2R_POLL_TIMEOUT_MS);
+		v4l2r_poll(&pfd, V4L2R_POLL_TIMEOUT_MS);
 	}
 }
 

@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -85,6 +86,29 @@ int v4l2r_query_control_default(struct v4l2r_context *ctx, uint32_t id,
 
 	*value = control.default_value;
 	return 0;
+}
+
+int v4l2r_poll(struct pollfd *pfd, int timeout_ms)
+{
+	uint64_t end = v4l2r_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+
+	for (;;) {
+		uint64_t now;
+		int ret = poll(pfd, 1, timeout_ms);
+
+		if (ret >= 0)
+			return ret;
+		if (errno != EINTR)
+			return -errno;
+
+		/* Interrupted by a signal handler (sandbox brokers, profilers
+		 * and IPC layers of multi-threaded clients deliver signals):
+		 * wait out the rest of the timeout. */
+		now = v4l2r_now_ns();
+		if (now >= end)
+			return 0;
+		timeout_ms = (int)((end - now + 999999) / 1000000);
+	}
 }
 
 /* --- queue/dequeue primitives, ctx->mutex must be held --- */
@@ -211,6 +235,66 @@ static void dequeue_completed_buffers(struct v4l2r_context *ctx,
 		continue;
 }
 
+/* State of one buffer as the kernel sees it, for wait failure reports. */
+static const char *buffer_state(struct v4l2r_context *ctx,
+				enum v4l2_buf_type type, uint32_t index,
+				char *str, size_t len)
+{
+	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
+	struct v4l2_buffer buffer = {
+		.index = index,
+		.type = type,
+		.memory = V4L2_MEMORY_MMAP,
+	};
+
+	if (V4L2_TYPE_IS_MULTIPLANAR(type)) {
+		buffer.length = VIDEO_MAX_PLANES;
+		buffer.m.planes = planes;
+	}
+
+	if (ioctl(ctx->video_fd, VIDIOC_QUERYBUF, &buffer) < 0) {
+		snprintf(str, len, "QUERYBUF %s", strerror(errno));
+		return str;
+	}
+
+	snprintf(str, len, "flags 0x%08x%s%s%s%s", buffer.flags,
+		 buffer.flags & V4L2_BUF_FLAG_QUEUED ? " queued" : "",
+		 buffer.flags & V4L2_BUF_FLAG_DONE ? " done" : "",
+		 buffer.flags & V4L2_BUF_FLAG_ERROR ? " error" : "",
+		 buffer.flags & V4L2_BUF_FLAG_IN_REQUEST ? " in-request" : "");
+	return str;
+}
+
+/*
+ * Report why a wait gave up: what poll() said, how long it waited, and what
+ * the kernel thinks of the awaited buffer and of the OUTPUT ring, which tells
+ * a decode that never started (OUTPUT still queued, request pending) from one
+ * that never completed or completed unseen.
+ */
+static void log_wait_failure(struct v4l2r_context *ctx, const char *what,
+			     enum v4l2_buf_type type, uint32_t index, int ret,
+			     short revents, uint64_t t0)
+{
+	char state[96];
+
+	v4l2r_log("wait on %s buffer %u failed after %.1f ms: %s (revents 0x%x); "
+		  "kernel: %s; queued capture 0x%016llx output 0x%x requests 0x%x, "
+		  "submitted %llu completed %llu\n", what, index,
+		  (v4l2r_now_ns() - t0) / 1e6,
+		  ret == 0 ? "timeout" : strerror(-ret), revents,
+		  buffer_state(ctx, type, index, state, sizeof(state)),
+		  (unsigned long long)ctx->queued_capture, ctx->queued_output,
+		  ctx->queued_request, (unsigned long long)ctx->submitted,
+		  (unsigned long long)ctx->completed);
+
+	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++)
+		v4l2r_log("  OUTPUT #%u (request fd %d): %s\n",
+			  ctx->output[i].index, ctx->output[i].request_fd,
+			  buffer_state(ctx, ctx->output_format.type,
+				       ctx->output[i].index, state,
+				       sizeof(state)));
+}
+
 static int wait_on_capture_locked(struct v4l2r_context *ctx, uint32_t index)
 {
 	struct pollfd pollfd = {
@@ -222,9 +306,13 @@ static int wait_on_capture_locked(struct v4l2r_context *ctx, uint32_t index)
 		dequeue_completed_buffers(ctx, ctx->capture_format.type);
 
 	while (ctx->queued_capture & (UINT64_C(1) << index)) {
-		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
-		if (ret <= 0)
+		uint64_t t0 = v4l2r_now_ns();
+		int ret = v4l2r_poll(&pollfd, V4L2R_POLL_TIMEOUT_MS);
+		if (ret <= 0) {
+			log_wait_failure(ctx, "CAPTURE", ctx->capture_format.type,
+					 index, ret, pollfd.revents, t0);
 			return -EIO;
+		}
 
 		ret = dequeue_buffer(ctx, ctx->capture_format.type);
 		if (ret < 0 && ret != -EAGAIN)
@@ -275,9 +363,15 @@ static int wait_completed_locked(struct v4l2r_context *ctx, uint64_t target)
 	 * Completion is in submission order, so this drains exactly the frames
 	 * submitted up to the target sequence. */
 	while (ctx->completed < target && ctx->queued_capture) {
-		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
-		if (ret <= 0)
+		uint64_t t0 = v4l2r_now_ns();
+		int ret = v4l2r_poll(&pollfd, V4L2R_POLL_TIMEOUT_MS);
+		if (ret <= 0) {
+			log_wait_failure(ctx, "CAPTURE (oldest)",
+					 ctx->capture_format.type,
+					 (uint32_t)__builtin_ctzll(ctx->queued_capture),
+					 ret, pollfd.revents, t0);
 			return -EIO;
+		}
 
 		ret = dequeue_buffer(ctx, ctx->capture_format.type);
 		if (ret < 0 && ret != -EAGAIN)
@@ -331,9 +425,13 @@ static struct v4l2r_output_buffer *next_output(struct v4l2r_context *ctx)
 		dequeue_completed_buffers(ctx, ctx->output_format.type);
 
 	while (ctx->queued_output & (1u << output->index)) {
-		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
-		if (ret <= 0)
+		uint64_t t0 = v4l2r_now_ns();
+		int ret = v4l2r_poll(&pollfd, V4L2R_POLL_TIMEOUT_MS);
+		if (ret <= 0) {
+			log_wait_failure(ctx, "OUTPUT", ctx->output_format.type,
+					 output->index, ret, pollfd.revents, t0);
 			goto fail;
+		}
 
 		ret = dequeue_buffer(ctx, ctx->output_format.type);
 		if (ret < 0 && ret != -EAGAIN)
@@ -365,9 +463,13 @@ static int wait_on_request(struct v4l2r_context *ctx,
 	};
 
 	while (ctx->queued_request & (1u << output->index)) {
-		int ret = poll(&pollfd, 1, V4L2R_POLL_TIMEOUT_MS);
-		if (ret <= 0)
+		int ret = v4l2r_poll(&pollfd, V4L2R_POLL_TIMEOUT_MS);
+		if (ret <= 0) {
+			v4l2r_log("request %d of OUTPUT buffer %u did not complete: %s\n",
+				  output->request_fd, output->index,
+				  ret == 0 ? "timeout" : strerror(-ret));
 			break;
+		}
 
 		if (pollfd.revents & (POLLPRI | POLLERR)) {
 			ctx->queued_request &= ~(1u << output->index);
