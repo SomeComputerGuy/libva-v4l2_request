@@ -1,3 +1,16 @@
+libva-v4l2-request (1.2+opi5.5-1) unstable; urgency=medium
+
+  * Reset pooled decoder descriptors with the device's own queue types: the
+    reset stopped all four buffer types, and the failing STREAMOFF of the
+    two the device lacks left the kernel context aborted, so a later decode
+    context on the descriptor never ran a job (Firefox 4K and 10-bit AV1).
+  * AV1: derive the tile sizes of uniform tile spacing instead of taking
+    VA's width/height_in_sbs_minus_1, which Chromium leaves zero then; the
+    VPU981 timed out on every frame (Chrome AV1 at ~1.4 frames/s).
+  * Log when readers of an exported buffer hold up a decode.
+
+ -- Arun Iyengar <aiyengar1990@gmail.com>  Fri, 06 Nov 2026 01:30:00 +0000
+
 libva-v4l2-request (1.2+opi5.4-1) unstable; urgency=medium
 
   * AV1: accept the slice data buffer ahead of its slice parameters
