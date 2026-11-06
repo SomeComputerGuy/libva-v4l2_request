@@ -1,3 +1,18 @@
+libva-v4l2-request (1.2+opi5.7-1) unstable; urgency=medium
+
+  * Decoded frames survive vaDestroyContext(): FFmpeg frees the decoder
+    while its last frames still wait to be read, and those reads crashed
+    (unmapped CAPTURE buffer) or returned empty frames.
+  * Serialize the codec state against surface reads from other threads
+    (AV1 held-back frame submitted twice / read unbound).
+  * Don't block a decode until every frame referencing its target buffer
+    has finished: mem2mem runs a context's jobs in order. Firefox no
+    longer drops 4K AV1 hardware decoding as "slow".
+  * Hand the decoder's line stride to the format converter, so 1080p
+    10-bit streams use the RGA3 when the kernel keeps the stride.
+
+ -- Arun Iyengar <aiyengar1990@gmail.com>  Fri, 06 Nov 2026 14:14:54 +0000
+
 libva-v4l2-request (1.2+opi5.6-1) unstable; urgency=medium
 
   * 10-bit HEVC/VP9 keep their depth: 10-bit configs offer P010 surfaces
