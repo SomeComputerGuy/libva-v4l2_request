@@ -29,3 +29,10 @@ av1_tiles_test = executable('av1_tiles_test', 'av1_tiles_test.c',
                             include_directories: [root_inc, include_directories('../src')],
                             dependencies: [libva_dep])
 test('av1_tiles', av1_tiles_test, timeout: 30)
+
+# devpool.c on its own, with ioctl() playing a mem2mem device.
+devpool_test = executable('devpool_test', 'devpool_test.c', '../src/devpool.c',
+                          include_directories: include_directories('../src'),
+                          link_args: ['-Wl,--wrap=ioctl'],
+                          dependencies: [threads_dep])
+test('devpool', devpool_test, timeout: 30)
