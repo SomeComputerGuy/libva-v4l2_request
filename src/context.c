@@ -476,7 +476,12 @@ static void capture_wait_readers(struct v4l2r_capture_buffer *capture)
 		if (capture->dmabuf_fd[i] < 0)
 			continue;
 
-		v4l2r_poll(&pfd, V4L2R_POLL_TIMEOUT_MS);
+		/* Decoding goes on after a timeout (the reader is outside our
+		 * control), but say so: it stalls the decode silently. */
+		if (v4l2r_poll(&pfd, V4L2R_POLL_TIMEOUT_MS) <= 0)
+			v4l2r_log("readers of exported CAPTURE plane %u (dma-buf fd %d) "
+				  "still busy after %d ms\n", i, pfd.fd,
+				  V4L2R_POLL_TIMEOUT_MS);
 	}
 }
 
