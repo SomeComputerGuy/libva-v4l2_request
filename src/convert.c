@@ -62,9 +62,11 @@ static bool convert_setup_hw(struct v4l2r_context *ctx,
 	if (conv->fd < 0)
 		return false;
 
-	/* Source side mirrors the decoder's CAPTURE format exactly; both
-	 * drivers derive the layout with v4l2_fill_pixfmt_mp(), so matching
-	 * pixelformat and size means matching strides and offsets. */
+	/* Source side mirrors the decoder's CAPTURE format exactly, including
+	 * the line stride the decoder reports (decoders align their lines
+	 * further than converters need: rkvdec to 64 bytes, so 1920 wide NV15
+	 * has 2432 bytes per line, not 2400). The converter must take that
+	 * stride as it is; the plane offsets follow from stride and height. */
 	conv->output_format = (struct v4l2_format) {
 		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 	};
@@ -72,6 +74,8 @@ static bool convert_setup_hw(struct v4l2r_context *ctx,
 	conv->output_format.fmt.pix_mp.width = width;
 	conv->output_format.fmt.pix_mp.height = height;
 	conv->output_format.fmt.pix_mp.num_planes = 1;
+	conv->output_format.fmt.pix_mp.plane_fmt[0].bytesperline =
+		v4l2r_format_bytesperline(&ctx->capture_format);
 	if (ioctl(conv->fd, VIDIOC_S_FMT, &conv->output_format) < 0)
 		goto fail;
 
@@ -80,8 +84,11 @@ static bool convert_setup_hw(struct v4l2r_context *ctx,
 	    conv->output_format.fmt.pix_mp.height != height ||
 	    v4l2r_format_bytesperline(&conv->output_format) !=
 	    v4l2r_format_bytesperline(&ctx->capture_format)) {
-		v4l2r_log("converter source layout mismatch for %.4s %ux%u\n",
-			  (const char *)&src_pixelformat, width, height);
+		v4l2r_log("converter source layout mismatch for %.4s %ux%u: "
+			  "stride %u, decoder %u\n",
+			  (const char *)&src_pixelformat, width, height,
+			  v4l2r_format_bytesperline(&conv->output_format),
+			  v4l2r_format_bytesperline(&ctx->capture_format));
 		goto fail;
 	}
 
@@ -845,11 +852,12 @@ static bool vpp_region_valid(const VARectangle *region,
 }
 
 /*
- * Set one side of the converter to the buffer's layout. The converter
- * derives its line stride from the format width alone, so when the
- * buffer's stride differs (its allocator aligned the line up), the format
- * is re-set with the width that yields the buffer's stride - the active
- * area is confined by the crop/compose rectangle, not the format.
+ * Set one side of the converter to the buffer's layout, asking for the
+ * buffer's own line stride. A converter that ignores a requested stride
+ * derives it from the width alone; then, when the buffer's stride differs
+ * (its allocator aligned the line up), the format is re-set with the width
+ * that yields the buffer's stride - the active area is confined by the
+ * crop/compose rectangle, not the format.
  */
 static int vpp_set_format(int fd, enum v4l2_buf_type type,
 			  uint32_t pixelformat, uint32_t width,
@@ -862,6 +870,7 @@ static int vpp_set_format(int fd, enum v4l2_buf_type type,
 		format->fmt.pix_mp.width = width;
 		format->fmt.pix_mp.height = height;
 		format->fmt.pix_mp.num_planes = 1;
+		format->fmt.pix_mp.plane_fmt[0].bytesperline = attempt ? 0 : pitch;
 		if (ioctl(fd, VIDIOC_S_FMT, format) < 0)
 			return -errno;
 
