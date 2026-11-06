@@ -2,7 +2,10 @@
  * Host test: AV1 tile entries come out the same whether a client sends a
  * picture's slice parameters before its slice data (FFmpeg) or the data
  * first and one parameter buffer per tile after it (Chromium), and the
- * first submission takes the CAPTURE bit depth from the sequence.
+ * first submission takes the CAPTURE bit depth from the sequence; and uniform
+ * tile spacing gives the same tile geometry whether the client fills VA's
+ * width/height_in_sbs_minus_1 (FFmpeg) or leaves them zero as VA allows
+ * (Chromium).
  *
  * Copyright (C) 2026 Arun Iyengar <aiyengar1990@gmail.com>
  *
@@ -188,8 +191,88 @@ static void run(int order, uint8_t bit_depth_idx)
 	free(ctx.drv);
 }
 
+/* Tile geometry of one frame of w x h with cols x rows uniform tiles. With
+ * fill, width/height_in_sbs_minus_1 hold the spec's sizes (FFmpeg) and are
+ * checked against the expected ones; without, they stay zero (Chromium). */
+static void geometry(uint32_t w, uint32_t h, unsigned int cols, unsigned int rows,
+		     bool uniform, const uint32_t *col_sbs, const uint32_t *row_sbs,
+		     bool fill, struct v4l2_av1_tile_info *out)
+{
+	struct v4l2r_context ctx = { 0 };
+	struct av1_context *codec = calloc(1, sizeof(*codec));
+	VADecPictureParameterBufferAV1 *pic = &codec->va_pic;
+
+	CHECK(codec);
+	ctx.drv = calloc(1, sizeof(*ctx.drv));	/* empty handle tables */
+	CHECK(ctx.drv);
+	ctx.codec = &v4l2r_codec_av1;
+	ctx.codec_priv = codec;
+	pic->frame_width_minus1 = (uint16_t)(w - 1);
+	pic->frame_height_minus1 = (uint16_t)(h - 1);
+	pic->tile_cols = (uint8_t)cols;
+	pic->tile_rows = (uint8_t)rows;
+	pic->pic_info_fields.bits.uniform_tile_spacing_flag = uniform;
+	if (fill) {
+		for (unsigned int i = 0; i < cols; i++)
+			pic->width_in_sbs_minus_1[i] = (uint16_t)(col_sbs[i] - 1);
+		for (unsigned int i = 0; i < rows; i++)
+			pic->height_in_sbs_minus_1[i] = (uint16_t)(row_sbs[i] - 1);
+	}
+	av1_fill_frame(&ctx);
+	*out = codec->frame.tile_info;
+	free(codec);
+	free(ctx.drv);
+
+	uint32_t mi = 0;
+	for (unsigned int i = 0; i < cols; i++) {
+		CHECK(out->width_in_sbs_minus_1[i] == col_sbs[i] - 1);
+		CHECK(out->mi_col_starts[i] == mi);
+		mi += col_sbs[i] << 4;
+	}
+	CHECK(out->mi_col_starts[cols] == 2 * ((w + 7) >> 3));
+	mi = 0;
+	for (unsigned int i = 0; i < rows; i++) {
+		CHECK(out->height_in_sbs_minus_1[i] == row_sbs[i] - 1);
+		CHECK(out->mi_row_starts[i] == mi);
+		mi += row_sbs[i] << 4;
+	}
+	CHECK(out->mi_row_starts[rows] == 2 * ((h + 7) >> 3));
+}
+
+static void tile_geometry(void)
+{
+	static const struct {
+		uint32_t w, h;
+		unsigned int cols, rows;
+		uint32_t col_sbs[4], row_sbs[2];
+	} cases[] = {
+		{ 1920, 1080, 1, 1, { 30 }, { 17 } },
+		{ 3840, 2160, 1, 1, { 60 }, { 34 } },
+		{ 3840, 2160, 4, 2, { 15, 15, 15, 15 }, { 17, 17 } },
+		{ 1920, 1080, 4, 2, { 8, 8, 8, 6 }, { 9, 8 } },
+		{ 1280, 720, 2, 1, { 10, 10 }, { 12 } },
+	};
+	struct v4l2_av1_tile_info chromium, ffmpeg;
+
+	for (unsigned int i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		geometry(cases[i].w, cases[i].h, cases[i].cols, cases[i].rows, true,
+			 cases[i].col_sbs, cases[i].row_sbs, false, &chromium);
+		geometry(cases[i].w, cases[i].h, cases[i].cols, cases[i].rows, true,
+			 cases[i].col_sbs, cases[i].row_sbs, true, &ffmpeg);
+		CHECK(!memcmp(&chromium, &ffmpeg, sizeof(chromium)));
+	}
+
+	/* Explicit spacing is taken as given. */
+	{
+		const uint32_t cols[2] = { 20, 10 }, rows[1] = { 17 };
+
+		geometry(1920, 1080, 2, 1, false, cols, rows, true, &ffmpeg);
+	}
+}
+
 int main(void)
 {
+	tile_geometry();
 	run(0, 0);
 	run(1, 0);
 	run(1, 1);

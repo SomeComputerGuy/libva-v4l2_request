@@ -172,6 +172,37 @@ static int av1_relative_dist(int a, int b, unsigned int order_hint_bits)
 	return (diff & (m - 1)) - (diff & m);
 }
 
+/*
+ * Tile sizes in superblocks of uniform tile spacing (AV1 spec 5.9.15,
+ * tile_info()): with TileColsLog2 = k every tile is
+ * ceil(sb_count / 2^k) superblocks wide except the last, which takes the
+ * rest. VA passes only the resulting tile count, so find the k that gives
+ * it. False if none does (malformed parameters).
+ */
+static bool av1_uniform_tile_sbs(uint32_t mi_count, unsigned int sb_shift,
+				 unsigned int tiles, uint32_t *sbs)
+{
+	uint32_t sb_count = (mi_count + (1u << sb_shift) - 1) >> sb_shift;
+
+	if (!tiles || !sb_count)
+		return false;
+
+	for (unsigned int k = 0; k <= 6; k++) {
+		uint32_t size = (sb_count + (1u << k) - 1) >> k;
+		uint32_t count = (sb_count + size - 1) / size;
+
+		if (count != tiles)
+			continue;
+
+		for (unsigned int i = 0; i + 1 < tiles; i++)
+			sbs[i] = size;
+		sbs[tiles - 1] = sb_count - size * (tiles - 1);
+		return true;
+	}
+
+	return false;
+}
+
 static void av1_fill_frame(struct v4l2r_context *ctx)
 {
 	struct av1_context *codec = ctx->codec_priv;
@@ -302,32 +333,52 @@ static void av1_fill_frame(struct v4l2r_context *ctx)
 	if (pic->pic_info_fields.bits.uniform_tile_spacing_flag)
 		frame->tile_info.flags |= V4L2_AV1_TILE_INFO_FLAG_UNIFORM_TILE_SPACING;
 
-	/* VA carries at most 63 explicit tile dimensions (width/height_in_sbs
-	 * arrays); the final tile size is derived from the mi_*_starts
-	 * terminator, so bound the reads to the VA array size. */
-	mi_start = 0;
-	for (unsigned int i = 0; i < tile_cols; i++) {
-		frame->tile_info.mi_col_starts[i] = mi_start;
-		if (i < 63) {
-			frame->tile_info.width_in_sbs_minus_1[i] =
-				pic->width_in_sbs_minus_1[i];
-			mi_start += (pic->width_in_sbs_minus_1[i] + 1) << sb_shift;
-		}
-	}
-	frame->tile_info.mi_col_starts[tile_cols] =
-		2 * ((frame_width + 7) >> 3);
+	{
+		uint32_t mi_cols = 2 * ((frame_width + 7) >> 3);
+		uint32_t mi_rows = 2 * ((frame_height + 7) >> 3);
+		uint32_t col_sbs[V4L2_AV1_MAX_TILE_COLS];
+		uint32_t row_sbs[V4L2_AV1_MAX_TILE_ROWS];
 
-	mi_start = 0;
-	for (unsigned int i = 0; i < tile_rows; i++) {
-		frame->tile_info.mi_row_starts[i] = mi_start;
-		if (i < 63) {
-			frame->tile_info.height_in_sbs_minus_1[i] =
-				pic->height_in_sbs_minus_1[i];
-			mi_start += (pic->height_in_sbs_minus_1[i] + 1) << sb_shift;
+		/*
+		 * VA defines width/height_in_sbs_minus_1 only for explicit
+		 * (non-uniform) tile spacing: Chromium leaves them zero with
+		 * uniform spacing (FFmpeg fills them either way), and taking
+		 * those zeros as 1x1 superblock tiles makes the VPU981 decode
+		 * garbage until its watchdog fires, ~0.7 s per frame. Derive
+		 * uniform tile sizes from the frame size instead.
+		 */
+		if (!pic->pic_info_fields.bits.uniform_tile_spacing_flag ||
+		    !av1_uniform_tile_sbs(mi_cols, sb_shift, tile_cols, col_sbs) ||
+		    !av1_uniform_tile_sbs(mi_rows, sb_shift, tile_rows, row_sbs)) {
+			/* VA carries at most 63 explicit tile dimensions; the
+			 * final tile size is derived from the mi_*_starts
+			 * terminator, so bound the reads to the VA array size. */
+			for (unsigned int i = 0; i < tile_cols; i++)
+				col_sbs[i] = i < 63 ? pic->width_in_sbs_minus_1[i] + 1u : 0;
+			for (unsigned int i = 0; i < tile_rows; i++)
+				row_sbs[i] = i < 63 ? pic->height_in_sbs_minus_1[i] + 1u : 0;
 		}
+
+		mi_start = 0;
+		for (unsigned int i = 0; i < tile_cols; i++) {
+			frame->tile_info.mi_col_starts[i] = mi_start;
+			if (col_sbs[i]) {
+				frame->tile_info.width_in_sbs_minus_1[i] = col_sbs[i] - 1;
+				mi_start += col_sbs[i] << sb_shift;
+			}
+		}
+		frame->tile_info.mi_col_starts[tile_cols] = mi_cols;
+
+		mi_start = 0;
+		for (unsigned int i = 0; i < tile_rows; i++) {
+			frame->tile_info.mi_row_starts[i] = mi_start;
+			if (row_sbs[i]) {
+				frame->tile_info.height_in_sbs_minus_1[i] = row_sbs[i] - 1;
+				mi_start += row_sbs[i] << sb_shift;
+			}
+		}
+		frame->tile_info.mi_row_starts[tile_rows] = mi_rows;
 	}
-	frame->tile_info.mi_row_starts[tile_rows] =
-		2 * ((frame_height + 7) >> 3);
 
 	if (pic->qmatrix_fields.bits.using_qmatrix)
 		frame->quantization.flags |= V4L2_AV1_QUANTIZATION_FLAG_USING_QMATRIX;
