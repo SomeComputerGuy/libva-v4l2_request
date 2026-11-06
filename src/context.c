@@ -493,11 +493,15 @@ static void capture_wait_readers(struct v4l2r_capture_buffer *capture)
  * surface's first decode.
  *
  * Before a later decode overwrites the buffer, wait until its own previous
- * decode has finished and, crucially, until every frame that referenced its
- * previous contents has completed. The kernel matches reference frames purely
- * by CAPTURE buffer timestamp and offers no protection against overwriting
- * one still in use (dev-stateless-decoder.rst), so this wait is what prevents
- * reference corruption.
+ * decode has finished (the buffer must be dequeued before it can be queued
+ * again). Frames that still reference its previous contents need no wait:
+ * the kernel reads references only while it runs a frame's job, and a
+ * mem2mem context runs one job at a time in queue order, so every frame
+ * queued before this decode - all frames that can reference the old
+ * contents - has finished reading them before this decode starts writing.
+ * Waiting for them here only blocked the client: a 4K AV1 temporal unit of
+ * several frames spent 20 ms and more in vaEndPicture, which Firefox
+ * counts as decode time and answers by dropping hardware decoding.
  */
 static int capture_buffer_bind(struct v4l2r_context *ctx,
 			       struct v4l2r_surface *surface)
@@ -528,13 +532,10 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 			  surface->id, index, recycled ? "recycled" : "new");
 	}
 
-	/* Do not overwrite the buffer while its own last decode is in flight,
-	 * while any frame still references its current contents, or while
-	 * the format converter is still reading it. */
+	/* Do not overwrite the buffer while its own last decode is in flight
+	 * or while the format converter is still reading it. */
 	uint64_t t0 = v4l2r_now_ns();
 	v4l2r_sync_capture(ctx, index);
-	uint64_t t1 = v4l2r_now_ns();
-	v4l2r_wait_completed(ctx, ctx->captures[index].last_ref_seq);
 	uint64_t t2 = v4l2r_now_ns();
 	v4l2r_convert_drain_index(ctx, index);
 
@@ -551,9 +552,9 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 	capture_wait_readers(&ctx->captures[index]);
 	uint64_t t3 = v4l2r_now_ns();
 
-	v4l2r_trace("bind wait (surface 0x%08x buf #%d): sync %.2f refwait %.2f "
+	v4l2r_trace("bind wait (surface 0x%08x buf #%d): sync %.2f "
 		    "readers %.2f ms\n", surface->id, index,
-		    (t1 - t0) / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6);
+		    (t2 - t0) / 1e6, (t3 - t2) / 1e6);
 
 	return 0;
 }
@@ -567,9 +568,7 @@ void v4l2r_context_release_capture(struct v4l2r_context *ctx, int index)
 	if (!ctx->captures[index].surface)
 		return;
 
-	/* Orphan the buffer for later recycling. It keeps its last_ref_seq so
-	 * a future decode that recycles it still waits out any frame that
-	 * referenced its contents. */
+	/* Orphan the buffer for later recycling. */
 	v4l2r_trace("release surface 0x%08x, orphan CAPTURE buffer #%d "
 		  "(free list now %u)\n",
 		  ctx->captures[index].surface->id, index, ctx->free_count + 1);

@@ -34,13 +34,6 @@ uint64_t v4l2r_surface_timestamp(struct v4l2r_driver *drv, VASurfaceID id)
 	if (!surface || surface->capture_index < 0)
 		return 0;
 
-	/* Remember that the frame currently being assembled references this
-	 * CAPTURE buffer, so its reuse can be gated on that frame completing. */
-	if (surface->ctx && surface->ctx->in_picture &&
-	    surface->capture_index < V4L2R_MAX_CAPTURE_BUFFERS)
-		surface->ctx->pic.ref_mask |=
-			UINT64_C(1) << surface->capture_index;
-
 	return v4l2r_capture_index_timestamp(surface->capture_index);
 }
 
@@ -349,59 +342,6 @@ void v4l2r_reap_capture(struct v4l2r_context *ctx)
 	pthread_mutex_unlock(&ctx->mutex);
 }
 
-static int wait_completed_locked(struct v4l2r_context *ctx, uint64_t target)
-{
-	struct pollfd pollfd = {
-		.fd = ctx->video_fd,
-		.events = POLLIN,
-	};
-
-	if (ctx->queued_capture)
-		dequeue_completed_buffers(ctx, ctx->capture_format.type);
-
-	/* Dequeue CAPTURE buffers in order until enough frames have completed.
-	 * Completion is in submission order, so this drains exactly the frames
-	 * submitted up to the target sequence. */
-	while (ctx->completed < target && ctx->queued_capture) {
-		uint64_t t0 = v4l2r_now_ns();
-		int ret = v4l2r_poll(&pollfd, V4L2R_POLL_TIMEOUT_MS);
-		if (ret <= 0) {
-			log_wait_failure(ctx, "CAPTURE (oldest)",
-					 ctx->capture_format.type,
-					 (uint32_t)__builtin_ctzll(ctx->queued_capture),
-					 ret, pollfd.revents, t0);
-			return -EIO;
-		}
-
-		ret = dequeue_buffer(ctx, ctx->capture_format.type);
-		if (ret < 0 && ret != -EAGAIN)
-			return ret;
-	}
-
-	return 0;
-}
-
-VAStatus v4l2r_wait_completed(struct v4l2r_context *ctx, uint64_t target)
-{
-	int ret;
-
-	if (!ctx->streaming || ctx->completed >= target)
-		return VA_STATUS_SUCCESS;
-
-	pthread_mutex_lock(&ctx->mutex);
-	ret = wait_completed_locked(ctx, target);
-	pthread_mutex_unlock(&ctx->mutex);
-
-	if (ret < 0) {
-		v4l2r_log("failed waiting for %llu CAPTURE completions (at %llu)\n",
-			  (unsigned long long)target,
-			  (unsigned long long)ctx->completed);
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-	}
-
-	return VA_STATUS_SUCCESS;
-}
-
 /*
  * Reserve the next OUTPUT buffer from the circular queue, waiting for its
  * previous use to be dequeued first.
@@ -497,12 +437,10 @@ VAStatus v4l2r_picture_begin(struct v4l2r_context *ctx,
 	if (!output)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	/* The target's CAPTURE buffer is bound (and, if reused, drained of its
-	 * references) at decode time, so there is nothing to sync here; only
-	 * reserve the OUTPUT buffer and reset the per-frame reference set. */
+	/* The target's CAPTURE buffer is bound at decode time, so there is
+	 * nothing to sync here; only reserve the OUTPUT buffer. */
 	ctx->pic.output = output;
 	ctx->pic.target = target;
-	ctx->pic.ref_mask = 0;
 
 	return VA_STATUS_SUCCESS;
 }
@@ -595,14 +533,6 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
 			v4l2r_log("failed to queue CAPTURE buffer %d: %s\n",
 				  target->capture_index, strerror(-ret));
 			goto fail;
-		}
-
-		/* ctx->submitted is now this frame's sequence number. Mark every
-		 * buffer it references as needed until this frame completes, so a
-		 * later decode cannot overwrite a reference still in use. */
-		for (unsigned int i = 0; i < ctx->nb_captures; i++) {
-			if (ctx->pic.ref_mask & (UINT64_C(1) << i))
-				ctx->captures[i].last_ref_seq = ctx->submitted;
 		}
 	}
 

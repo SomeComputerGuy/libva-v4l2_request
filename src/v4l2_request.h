@@ -235,11 +235,6 @@ struct v4l2r_capture_buffer {
 	uint32_t plane_size[VIDEO_MAX_PLANES];
 	int dmabuf_fd[VIDEO_MAX_PLANES];	/* exported lazily, -1 if not */
 	void *map[VIDEO_MAX_PLANES];		/* mmap()ed lazily, NULL if not */
-	/* Submission count of the most recent frame that used this buffer as a
-	 * reference. A new decode may not overwrite the buffer until
-	 * ctx->completed reaches this value, i.e. until every frame that
-	 * references its current contents has finished decoding. */
-	uint64_t last_ref_seq;
 };
 
 struct v4l2r_output_buffer {
@@ -255,10 +250,6 @@ struct v4l2r_output_buffer {
 struct v4l2r_picture {
 	struct v4l2r_output_buffer *output;
 	struct v4l2r_surface *target;
-	/* Bitmask of CAPTURE buffer indices this frame references, accumulated
-	 * as the codec resolves reference timestamps. Used to mark those
-	 * buffers as needed until this frame completes. */
-	uint64_t ref_mask;
 };
 
 struct v4l2r_buffer {
@@ -568,11 +559,6 @@ VAStatus v4l2r_decode(struct v4l2r_context *ctx,
 
 /* Block until the CAPTURE buffer of the surface has been dequeued. */
 VAStatus v4l2r_sync_capture(struct v4l2r_context *ctx, int capture_index);
-
-/* Block until at least the first target frames have completed decoding, i.e.
- * until ctx->completed >= target. Used to drain the frames that reference a
- * buffer before it is overwritten by a new decode. */
-VAStatus v4l2r_wait_completed(struct v4l2r_context *ctx, uint64_t target);
 
 /* Non-blocking dequeue sweep, used by vaQuerySurfaceStatus. */
 void v4l2r_reap_capture(struct v4l2r_context *ctx);
