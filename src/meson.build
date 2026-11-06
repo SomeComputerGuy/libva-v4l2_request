@@ -3,6 +3,8 @@ sources = [
   'handles.c',
   'context.c',
   'convert.c',
+  'pixconv.c',
+  'fmtsel.c',
   'decode.c',
   'surface.c',
   'buffer.c',

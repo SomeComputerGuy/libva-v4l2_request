@@ -37,6 +37,7 @@
 #include <va/va_vpp.h>
 
 #include "config.h"
+#include "fmtsel.h"
 
 /* Monotonic timestamp in nanoseconds, for measuring how long waits block. */
 static inline uint64_t v4l2r_now_ns(void)
@@ -57,6 +58,7 @@ static inline uint64_t v4l2r_now_ns(void)
 
 #define V4L2R_MAX_DECODERS		8
 #define V4L2R_MAX_PIXELFORMATS		16
+#define V4L2R_MAX_CONVERTERS		4
 
 /* Number of OUTPUT (bitstream) buffers in the per-context circular queue. */
 #define V4L2R_OUTPUT_BUFFERS		4
@@ -117,14 +119,17 @@ struct v4l2r_decoder {
 /*
  * A plain (non-request) V4L2 mem2mem format converter, e.g. the Rockchip
  * RGA. Used to turn decoder-only CAPTURE formats (the packed 10-bit NV15)
- * into NV12 that displays and clients can consume. pixelformats lists the
- * source (OUTPUT queue) formats the device can read.
+ * into P010 or NV12 that displays and clients can consume. pixelformats
+ * lists the source (OUTPUT queue) formats the device can read,
+ * dst_pixelformats the formats it writes (of those the driver hands out).
  */
 struct v4l2r_converter {
 	char video_path[256];
 	char card[32];
 	uint32_t pixelformats[V4L2R_MAX_PIXELFORMATS];
 	unsigned int nb_pixelformats;
+	uint32_t dst_pixelformats[V4L2R_MAX_PIXELFORMATS];
+	unsigned int nb_dst_pixelformats;
 };
 
 /*
@@ -335,13 +340,24 @@ struct v4l2r_context {
 /*
  * Per-context state of the format converter chain: decoded frames are run
  * through a mem2mem converter (decoder CAPTURE dma-buf in, surface backing
- * dma-buf out) as soon as their decode finishes. All fields are protected
- * by ctx->mutex.
+ * dma-buf out) as soon as their decode finishes, or, on the CPU route,
+ * converted by the CPU when the surface is first read. All fields are
+ * protected by ctx->mutex.
  */
 struct v4l2r_convert {
-	int fd;
+	enum v4l2r_conv_route route;		/* HW (mem2mem) or CPU */
+	uint32_t dst_pixelformat;		/* NV12 or P010 */
+	const struct v4l2r_converter *converter;	/* HW route */
+	int fd;					/* HW route, -1 otherwise */
 	struct v4l2_format output_format;	/* source = decoder CAPTURE format */
-	struct v4l2_format capture_format;	/* destination, NV12 */
+	struct v4l2_format capture_format;	/* destination (NV12/P010) */
+	/* CPU route: CAPTURE buffers decoded but not converted yet. Taken
+	 * before ctx->mutex, serializes CPU conversions against the reuse of
+	 * their source buffers. */
+	uint64_t cpu_pending;
+	pthread_mutex_t cpu_mutex;
+	uint64_t cpu_frames;
+	uint64_t cpu_ns;
 	uint32_t busy;				/* bitmask of in-flight slots */
 	unsigned int next_slot;
 	struct {
@@ -399,9 +415,9 @@ struct v4l2r_driver {
 	 * one (see v4l2r_converter_available). It has its own lock because
 	 * callers may hold drv->mutex (e.g. vaQueryConfigProfiles). */
 	pthread_mutex_t converter_mutex;
-	struct v4l2r_converter converter;
+	struct v4l2r_converter converters[V4L2R_MAX_CONVERTERS];
+	unsigned int nb_converters;
 	bool converter_probed;
-	bool has_converter;
 };
 
 static inline struct v4l2r_driver *v4l2r_driver(VADriverContextP va_ctx)
@@ -573,15 +589,26 @@ void v4l2r_context_release_capture(struct v4l2r_context *ctx, int index);
  * never pay for the scan. */
 bool v4l2r_converter_available(struct v4l2r_driver *drv);
 
-/* Whether the detected converter can read this pixelformat. */
+/* The first converter that reads src and writes dst, or NULL. */
+const struct v4l2r_converter *v4l2r_converter_find(struct v4l2r_driver *drv,
+						   uint32_t src, uint32_t dst);
+/* Whether some converter can turn this pixelformat into NV12. */
 bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat);
-/* Whether the converter reads the 10-bit format some decoder writes. */
-bool v4l2r_converter_handles_10bit(struct v4l2r_driver *drv);
+/* What the system can do with 10-bit decodes (probes the converters). */
+void v4l2r_10bit_caps(struct v4l2r_driver *drv, struct v4l2r_10bit_caps *caps);
+/* Whether the CPU conversion fallback may be used (V4L2R_NO_CPU_CONVERT
+ * unset) for this decoder-only format. */
+bool v4l2r_cpu_convert_supports(uint32_t pixelformat);
+/* The VA fourcc (NV12/P010) a surface presents to clients. */
+uint32_t v4l2r_surface_fourcc(struct v4l2r_driver *drv,
+			      const struct v4l2r_surface *surface);
 
-/* Set up the conversion chain for the context's selected CAPTURE format.
- * Called once from the CAPTURE setup path; on failure the context decodes
- * without conversion (and 10-bit output stays NV15). */
-VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx);
+/* Set up the conversion chain for the context's selected CAPTURE format,
+ * producing the format the first decoded surface presents (P010 or NV12):
+ * on a mem2mem converter when one can, else on the CPU. Called once from
+ * the CAPTURE setup path; on failure ctx->conv stays NULL. */
+VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx,
+			     struct v4l2r_surface *surface);
 void v4l2r_convert_destroy(struct v4l2r_context *ctx);
 
 /* Queue the conversion of a just-decoded CAPTURE buffer into its surface's
@@ -601,6 +628,7 @@ VAStatus v4l2r_convert_wait(struct v4l2r_surface *surface);
  * and scaling blits between surfaces, run on the format converter. */
 struct v4l2r_vpp {
 	int fd;				/* configured converter, -1 until first blit */
+	const struct v4l2r_converter *converter;	/* the one fd belongs to */
 	struct v4l2_format output_format;	/* source */
 	struct v4l2_format capture_format;	/* destination, NV12 */
 
@@ -664,7 +692,8 @@ int v4l2r_export_capture_dmabufs(struct v4l2r_context *ctx,
 				 int capture_index);
 
 /* Ensure the surface has standalone backing matching the converter's
- * destination format (NV12 at the converter CAPTURE layout). */
+ * destination format (NV12 or P010; on the HW route at the converter
+ * CAPTURE layout). */
 VAStatus v4l2r_surface_convert_backing(struct v4l2r_driver *drv,
 				       struct v4l2r_surface *surface);
 

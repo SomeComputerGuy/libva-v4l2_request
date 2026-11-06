@@ -22,8 +22,9 @@ stateless interface): MPEG-2, H.264, HEVC, VP8, VP9, AV1.
 
 On Rockchip SoCs whose decoders emit 10-bit content only as packed NV15
 (which no GPU or display controller stack can import), the driver chains
-the RGA into the decode pipeline and converts frames to NV12 in hardware;
-see "10-bit decoding and the RGA converter" below.
+the RGA into the decode pipeline and converts frames to P010 (or NV12)
+in hardware, or on the CPU when no RGA reads NV15; see "10-bit decoding
+and the RGA converter" below.
 
 Have fun,
 	~megi
@@ -52,7 +53,14 @@ Environment variables:
   V4L2R_NO_CONVERT=1
       Disable detection and use of the mem2mem format converter. Streams
       that decode to a format nothing can consume (10-bit NV15) are then
-      refused instead of converted.
+      converted on the CPU (or refused, see V4L2R_NO_CPU_CONVERT).
+
+  V4L2R_NO_CPU_CONVERT=1
+      Disable the CPU conversion fallback for NV15. Without a converter
+      that reads NV15, 10-bit HEVC/VP9 profiles are then not offered.
+
+  V4L2R_CPU_CONVERT_THREADS=N
+      Threads per frame for the CPU conversion (1-8, default 4).
 
 
 Using with mpv
@@ -288,25 +296,33 @@ packed NV15 layout (4 samples in 5 bytes). There is no VA fourcc for it,
 GPU drivers cannot import it, and Wayland compositors do not accept it,
 so NV15 frames are undisplayable as-is.
 
-When a plain (non-request) V4L2 mem2mem converter that can read such a
-format and write NV12 is present - the Rockchip RGA - the driver chains
-it behind the decoder (the converter is probed on first need, so plain
-8-bit playback never scans for one):
+10-bit VA configs advertise P010 surfaces (VA_RT_FORMAT_YUV420_10,
+exported as DRM_FORMAT_P010), so the full depth reaches the client (HDR),
+and NV12 as a down-conversion for clients that ask for it. The decoder's
+NV15 reaches the surface format through, in this order:
 
-- 10-bit VA configs then advertise NV12 surfaces only (FFmpeg accepts
-  the depth loss and decodes into NV12-labeled surfaces).
-- As soon as a frame's decode completes, its CAPTURE buffer is queued to
-  the converter (decoder dma-buf in, the surface's NV12 backing dma-buf
-  out) and the conversion overlaps the following decodes. Readers wait
-  for the conversion result; exports hand out the converted NV12 buffer.
-- No pixel ever passes through the CPU: decode, 10-to-8 conversion and
-  display are all zero-copy hardware paths.
-- Reference frames are unaffected; the decoder keeps referencing its own
-  NV15 buffers.
+- a plain (non-request) V4L2 mem2mem converter that reads NV15 and
+  writes the surface format - the RK3588 RGA3 does both P010 and NV12
+  (all converters are probed on first need, so plain 8-bit playback never
+  scans for one; the first one that can do the conversion is used). As
+  soon as a frame's decode completes, its CAPTURE buffer is queued to the
+  converter (decoder dma-buf in, the surface's backing dma-buf out) and
+  the conversion overlaps the following decodes. Readers wait for the
+  result; exports hand out the converted buffer. No pixel passes through
+  the CPU.
+- otherwise the CPU (NEON on arm64, rows split over 4 threads), when the
+  surface is first read (sync, export, image). The log reports the
+  average time per frame when the context ends.
 
-Without a usable converter the driver refuses to decode such streams
-(the first decode fails and players fall back to software decoding);
-there is no software conversion fallback.
+Reference frames are unaffected; the decoder keeps referencing its own
+NV15 buffers. If the only converter writes NV12 (RGA2 with the patch
+below), 10-bit configs keep NV12 as their only hardware-fast format and
+do not advertise P010, as FFmpeg would pick P010 as the exact match and
+take the CPU route.
+
+Without a converter and with V4L2R_NO_CPU_CONVERT set, the driver does
+not offer 10-bit HEVC/VP9 profiles and refuses to decode such streams
+(players fall back to software decoding).
 
 IMPORTANT: the mainline rockchip-rga kernel driver does not support NV15
 sources. The required kernel patch is included in patches/:

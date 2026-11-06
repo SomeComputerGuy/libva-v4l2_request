@@ -556,10 +556,23 @@ static void enumerate_decoders(struct v4l2r_driver *drv)
 	}
 }
 
+static bool v4l2r_converter_find_in(const struct v4l2r_converter *conv,
+				     uint32_t src, uint32_t dst)
+{
+	bool reads = false, writes = false;
+
+	for (unsigned int i = 0; i < conv->nb_pixelformats; i++)
+		reads |= conv->pixelformats[i] == src;
+	for (unsigned int i = 0; i < conv->nb_dst_pixelformats; i++)
+		writes |= conv->dst_pixelformats[i] == dst;
+
+	return reads && writes;
+}
+
 /*
  * A usable format converter is a plain (non-request) mem2mem device that
- * can read at least one decoder-only CAPTURE format and write NV12, e.g.
- * the Rockchip RGA reading packed 10-bit NV15.
+ * can read at least one decoder-only CAPTURE format and write NV12 or P010,
+ * e.g. the Rockchip RGA3 reading packed 10-bit NV15.
  */
 static bool video_device_is_converter(const char *path,
 				      struct v4l2r_converter *conv)
@@ -567,7 +580,7 @@ static bool video_device_is_converter(const char *path,
 	struct v4l2_capability capability = {0};
 	struct v4l2_fmtdesc fmtdesc = {0};
 	unsigned int capabilities;
-	bool nv12_capture = false;
+	bool dst_usable = false;
 	bool src_convertible = false;
 	int fd;
 
@@ -605,18 +618,23 @@ static bool video_device_is_converter(const char *path,
 		fmtdesc.index++;
 	}
 
+	/* Collect the presentable formats it writes. */
+	conv->nb_dst_pixelformats = 0;
 	memset(&fmtdesc, 0, sizeof(fmtdesc));
 	fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-	while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
-		if (fmtdesc.pixelformat == V4L2_PIX_FMT_NV12) {
-			nv12_capture = true;
-			break;
+	while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0 &&
+	       conv->nb_dst_pixelformats < V4L2R_MAX_PIXELFORMATS) {
+		if (fmtdesc.pixelformat == V4L2_PIX_FMT_NV12 ||
+		    fmtdesc.pixelformat == V4L2_PIX_FMT_P010) {
+			conv->dst_pixelformats[conv->nb_dst_pixelformats++] =
+				fmtdesc.pixelformat;
+			dst_usable = true;
 		}
 		fmtdesc.index++;
 	}
 
 	close(fd);
-	return src_convertible && nv12_capture;
+	return src_convertible && dst_usable;
 
 fail:
 	close(fd);
@@ -646,15 +664,28 @@ static void enumerate_converters(struct v4l2r_driver *drv)
 		if (is_decoder)
 			continue;
 
-		if (!video_device_is_converter(video_path, &drv->converter))
+		struct v4l2r_converter *conv =
+			&drv->converters[drv->nb_converters];
+
+		if (!video_device_is_converter(video_path, conv))
 			continue;
 
-		snprintf(drv->converter.video_path,
-			 sizeof(drv->converter.video_path), "%s", video_path);
-		drv->has_converter = true;
-		v4l2r_log("detected format converter %s [%s]\n",
-			  video_path, drv->converter.card);
-		return;
+		snprintf(conv->video_path, sizeof(conv->video_path), "%s",
+			 video_path);
+		v4l2r_log("detected format converter %s [%s]%s%s\n",
+			  video_path, conv->card,
+			  v4l2r_converter_find_in(conv, V4L2_PIX_FMT_NV15,
+						  V4L2_PIX_FMT_P010) ?
+				  " NV15->P010" : "",
+			  v4l2r_converter_find_in(conv, V4L2_PIX_FMT_NV15,
+						  V4L2_PIX_FMT_NV12) ?
+				  " NV15->NV12" : "");
+
+		/* Keep all of them: the RK3588 has an RGA2 (no NV15) and an
+		 * RGA3, and which one can serve a conversion depends on the
+		 * formats. */
+		if (++drv->nb_converters == V4L2R_MAX_CONVERTERS)
+			return;
 	}
 }
 
@@ -677,23 +708,40 @@ bool v4l2r_converter_available(struct v4l2r_driver *drv)
 		enumerate_converters(drv);
 		drv->converter_probed = true;
 	}
-	available = drv->has_converter;
+	available = drv->nb_converters > 0;
 	pthread_mutex_unlock(&drv->converter_mutex);
 
 	return available;
 }
 
-bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat)
+const struct v4l2r_converter *v4l2r_converter_find(struct v4l2r_driver *drv,
+						   uint32_t src, uint32_t dst)
 {
 	if (!v4l2r_converter_available(drv))
-		return false;
+		return NULL;
 
-	for (unsigned int i = 0; i < drv->converter.nb_pixelformats; i++) {
-		if (drv->converter.pixelformats[i] == pixelformat)
-			return true;
+	for (unsigned int i = 0; i < drv->nb_converters; i++) {
+		if (v4l2r_converter_find_in(&drv->converters[i], src, dst))
+			return &drv->converters[i];
 	}
 
+	return NULL;
+}
+
+bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat)
+{
+	return v4l2r_converter_find(drv, pixelformat, V4L2_PIX_FMT_NV12) != NULL;
+}
+
+bool v4l2r_cpu_convert_supports(uint32_t pixelformat)
+{
+#if defined(V4L2_PIX_FMT_NV15)
+	return pixelformat == V4L2_PIX_FMT_NV15 &&
+	       !getenv("V4L2R_NO_CPU_CONVERT");
+#else
+	(void)pixelformat;
 	return false;
+#endif
 }
 
 static bool driver_supports_pixelformat(struct v4l2r_driver *drv,
@@ -720,37 +768,68 @@ static bool driver_supports_hevc_10bit(struct v4l2r_driver *drv)
 	return false;
 }
 
-bool v4l2r_converter_handles_10bit(struct v4l2r_driver *drv)
+void v4l2r_10bit_caps(struct v4l2r_driver *drv, struct v4l2r_10bit_caps *caps)
 {
+	memset(caps, 0, sizeof(*caps));
+
 	for (unsigned int i = 0; i < drv->nb_decoders; i++) {
 		uint32_t fmt = drv->decoders[i].hevc_10bit_native_format;
 
-		if (fmt && v4l2r_converter_supports(drv, fmt))
-			return true;
+		if (drv->decoders[i].hevc_10bit_va_output)
+			caps->native_p010 = true;
+		if (!fmt)
+			continue;
+		if (v4l2r_converter_find(drv, fmt, V4L2_PIX_FMT_P010))
+			caps->hw_p010 = true;
+		if (v4l2r_converter_find(drv, fmt, V4L2_PIX_FMT_NV12))
+			caps->hw_nv12 = true;
+		if (v4l2r_cpu_convert_supports(fmt))
+			caps->cpu = true;
 	}
+}
 
-	return false;
+uint32_t v4l2r_surface_fourcc(struct v4l2r_driver *drv,
+			      const struct v4l2r_surface *surface)
+{
+	struct v4l2r_10bit_caps caps;
+
+	if (surface->fourcc == VA_FOURCC_NV12 ||
+	    surface->fourcc == VA_FOURCC_P010)
+		return surface->fourcc;
+	if (!(surface->rt_format & VA_RT_FORMAT_YUV420_10))
+		return VA_FOURCC_NV12;
+
+	v4l2r_10bit_caps(drv, &caps);
+	return v4l2r_fmtsel_surface_fourcc(surface->fourcc, surface->rt_format,
+					   &caps);
 }
 
 /*
  * Whether 10-bit frames can be handed out at all: either a decoder writes a
- * format VA can describe (P010), or the converter turns the decoder-only
- * format (Rockchip NV15) into NV12. A converter that merely exists is not
- * enough: the mainline Rockchip RGA reads NV16 (so it qualifies as a
- * converter) but not NV15. Otherwise advertising Main10 or VP9
- * Profile 2 makes clients pick hardware decoding that fails on the first
- * frame, and Chromium reports resolutions it cannot play. The HEVC probe
- * stands in for VP9 Profile 2, which uses the same CAPTURE formats on the
- * decoders we know (rkvdec).
+ * format VA can describe (P010), or the decoder-only format (Rockchip NV15)
+ * can be turned into P010/NV12, by a converter or by the CPU. A converter
+ * that merely exists is not enough: the mainline Rockchip RGA2 reads NV16
+ * (so it qualifies as a converter) but not NV15. Otherwise advertising
+ * Main10 or VP9 Profile 2 makes clients pick hardware decoding that fails
+ * on the first frame, and Chromium reports resolutions it cannot play. The
+ * HEVC probe stands in for VP9 Profile 2, which uses the same CAPTURE
+ * formats on the decoders we know (rkvdec).
+ *
+ * The CPU route is checked before the converters so that listing the
+ * profiles (vainfo, every client start) does not scan the device nodes.
  */
 static bool driver_has_10bit_output(struct v4l2r_driver *drv)
 {
+	struct v4l2r_10bit_caps caps;
+
 	for (unsigned int i = 0; i < drv->nb_decoders; i++) {
-		if (drv->decoders[i].hevc_10bit_va_output)
+		if (drv->decoders[i].hevc_10bit_va_output ||
+		    v4l2r_cpu_convert_supports(drv->decoders[i].hevc_10bit_native_format))
 			return true;
 	}
 
-	return v4l2r_converter_handles_10bit(drv);
+	v4l2r_10bit_caps(drv, &caps);
+	return v4l2r_fmtsel_10bit_usable(&caps);
 }
 
 /*

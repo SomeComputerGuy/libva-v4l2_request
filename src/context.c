@@ -613,11 +613,13 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 
 		/*
 		 * When the decoder can only produce a format nothing can
-		 * consume directly (packed 10-bit NV15), chain the hardware
-		 * format converter behind it. Without a converter such a
-		 * stream cannot be presented at all: fail the decode so the
-		 * client falls back to software instead of getting frames
-		 * it cannot display.
+		 * consume directly (packed 10-bit NV15), chain a format
+		 * converter behind it: the hardware one when it can, else
+		 * the CPU, into the format the surface presents (P010 for
+		 * 10-bit surfaces). Without either such a stream cannot be
+		 * presented at all: fail the decode so the client falls
+		 * back to software instead of getting frames it cannot
+		 * display.
 		 */
 		{
 			const struct v4l2r_format_info *info =
@@ -625,7 +627,7 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 					v4l2r_format_pixelformat(&ctx->capture_format));
 
 			if (info && !info->va_fourcc) {
-				v4l2r_convert_setup(ctx);
+				v4l2r_convert_setup(ctx, surface);
 				if (!ctx->conv) {
 					v4l2r_log("no usable format converter for %.4s, "
 						  "refusing hardware decoding\n",

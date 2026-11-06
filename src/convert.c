@@ -1,10 +1,11 @@
 /*
  * Format converter chain: decoder-only CAPTURE formats (the packed 10-bit
- * NV15 produced by Rockchip decoders) are converted to NV12 with a plain
- * V4L2 mem2mem device (the Rockchip RGA), fully in hardware.
+ * NV15 produced by Rockchip decoders) are converted to P010 (10-bit
+ * surfaces) or NV12 with a plain V4L2 mem2mem device (the Rockchip RGA3),
+ * fully in hardware, or by the CPU when no converter reads the format.
  *
  * The decoder's CAPTURE buffer is imported into the converter's OUTPUT
- * queue and the surface's standalone NV12 backing into its CAPTURE queue,
+ * queue and the surface's standalone backing into its CAPTURE queue,
  * both as dma-bufs, so no pixel ever passes through the CPU. Conversions
  * are kicked as soon as a decode finishes (from the CAPTURE dequeue path)
  * and overlap subsequent decodes; readers wait for the result through
@@ -30,9 +31,11 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <linux/dma-buf.h>
 #include <linux/videodev2.h>
 
 #include "v4l2_request.h"
+#include "pixconv.h"
 
 #define V4L2R_CONVERT_TIMEOUT_MS 2000
 
@@ -42,30 +45,22 @@
 #define V4L2R_VPP_MIN_DIM 34
 #define V4L2R_VPP_MAX_DIM 8192
 
-VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx)
+/* Hardware route: the converter reads the decoder's CAPTURE dma-buf and
+ * writes the surface backing, both imported. */
+static bool convert_setup_hw(struct v4l2r_context *ctx,
+			     struct v4l2r_convert *conv,
+			     const struct v4l2r_converter *converter,
+			     uint32_t dst_pixelformat)
 {
-	struct v4l2r_driver *drv = ctx->drv;
-	struct v4l2r_convert *conv;
 	struct v4l2_requestbuffers reqbufs;
 	enum v4l2_buf_type type;
 	uint32_t src_pixelformat = v4l2r_format_pixelformat(&ctx->capture_format);
 	uint32_t width = v4l2r_format_width(&ctx->capture_format);
 	uint32_t height = v4l2r_format_height(&ctx->capture_format);
 
-	if (!v4l2r_converter_supports(drv, src_pixelformat))
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	/* Importing into the converter needs a single memory plane. */
-	if (v4l2r_format_num_planes(&ctx->capture_format) != 1)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	conv = calloc(1, sizeof(*conv));
-	if (!conv)
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-
-	conv->fd = open(drv->converter.video_path, O_RDWR | O_NONBLOCK);
+	conv->fd = open(converter->video_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (conv->fd < 0)
-		goto fail;
+		return false;
 
 	/* Source side mirrors the decoder's CAPTURE format exactly; both
 	 * drivers derive the layout with v4l2_fill_pixfmt_mp(), so matching
@@ -93,19 +88,19 @@ VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx)
 	conv->capture_format = (struct v4l2_format) {
 		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
 	};
-	conv->capture_format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+	conv->capture_format.fmt.pix_mp.pixelformat = dst_pixelformat;
 	conv->capture_format.fmt.pix_mp.width = width;
 	conv->capture_format.fmt.pix_mp.height = height;
 	conv->capture_format.fmt.pix_mp.num_planes = 1;
 	if (ioctl(conv->fd, VIDIOC_S_FMT, &conv->capture_format) < 0)
 		goto fail;
 
-	if (conv->capture_format.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12 ||
+	if (conv->capture_format.fmt.pix_mp.pixelformat != dst_pixelformat ||
 	    conv->capture_format.fmt.pix_mp.width != width ||
 	    conv->capture_format.fmt.pix_mp.height != height ||
 	    conv->capture_format.fmt.pix_mp.num_planes != 1) {
-		v4l2r_log("converter cannot produce NV12 at %ux%u\n",
-			  width, height);
+		v4l2r_log("converter cannot produce %.4s at %ux%u\n",
+			  (const char *)&dst_pixelformat, width, height);
 		goto fail;
 	}
 
@@ -134,22 +129,117 @@ VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx)
 	if (ioctl(conv->fd, VIDIOC_STREAMON, &type) < 0)
 		goto fail;
 
+	conv->converter = converter;
+	return true;
+
+fail:
+	close(conv->fd);
+	conv->fd = -1;
+	return false;
+}
+
+/* CPU route: nothing to open; the destination is described by size and
+ * format only (the CPU writes whatever pitch the backing has). */
+static void convert_setup_cpu(struct v4l2r_context *ctx,
+			      struct v4l2r_convert *conv,
+			      uint32_t dst_pixelformat)
+{
+	conv->output_format = ctx->capture_format;
+	conv->capture_format = (struct v4l2_format) {
+		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+	};
+	conv->capture_format.fmt.pix_mp.pixelformat = dst_pixelformat;
+	conv->capture_format.fmt.pix_mp.width =
+		v4l2r_format_width(&ctx->capture_format);
+	conv->capture_format.fmt.pix_mp.height =
+		v4l2r_format_height(&ctx->capture_format);
+	conv->capture_format.fmt.pix_mp.num_planes = 1;
+}
+
+static uint32_t fourcc_pixelformat(uint32_t fourcc)
+{
+	return fourcc == VA_FOURCC_P010 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
+}
+
+VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx,
+			     struct v4l2r_surface *surface)
+{
+	struct v4l2r_driver *drv = ctx->drv;
+	struct v4l2r_convert *conv;
+	struct v4l2r_10bit_caps caps = {0};
+	uint32_t src_pixelformat = v4l2r_format_pixelformat(&ctx->capture_format);
+	uint32_t wanted = v4l2r_surface_fourcc(drv, surface);
+	bool strict = surface->fourcc != 0;
+
+	/* Importing into the converter, and the CPU route, need a single
+	 * memory plane. */
+	if (v4l2r_format_num_planes(&ctx->capture_format) != 1)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	conv = calloc(1, sizeof(*conv));
+	if (!conv)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	conv->fd = -1;
+
+	/* What can turn this very format into what. */
+	caps.hw_p010 = v4l2r_converter_find(drv, src_pixelformat,
+					    V4L2_PIX_FMT_P010) != NULL;
+	caps.hw_nv12 = v4l2r_converter_find(drv, src_pixelformat,
+					    V4L2_PIX_FMT_NV12) != NULL;
+	caps.cpu = v4l2r_cpu_convert_supports(src_pixelformat);
+
+	for (;;) {
+		uint32_t dst_fourcc;
+		enum v4l2r_conv_route route =
+			v4l2r_fmtsel_route(wanted, strict, &caps, &dst_fourcc);
+		uint32_t dst = fourcc_pixelformat(dst_fourcc);
+
+		if (route == V4L2R_ROUTE_NONE) {
+			free(conv);
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		}
+
+		if (route == V4L2R_ROUTE_CPU) {
+			convert_setup_cpu(ctx, conv, dst);
+			conv->route = route;
+			conv->dst_pixelformat = dst;
+			break;
+		}
+
+		if (convert_setup_hw(ctx, conv,
+				     v4l2r_converter_find(drv, src_pixelformat, dst),
+				     dst)) {
+			conv->route = route;
+			conv->dst_pixelformat = dst;
+			break;
+		}
+
+		/* This converter cannot take the decoder's layout; try the
+		 * next route. */
+		if (dst == V4L2_PIX_FMT_P010)
+			caps.hw_p010 = false;
+		else
+			caps.hw_nv12 = false;
+	}
+
+	pthread_mutex_init(&conv->cpu_mutex, NULL);
 	for (unsigned int i = 0; i < V4L2R_CONVERT_SLOTS; i++)
 		conv->jobs[i].capture_index = -1;
 
 	ctx->conv = conv;
 
-	v4l2r_log("converting %.4s to NV12 via %s [%s]\n",
-		  (const char *)&src_pixelformat, drv->converter.video_path,
-		  drv->converter.card);
+	if (conv->route == V4L2R_ROUTE_HW)
+		v4l2r_log("converting %.4s to %.4s via %s [%s]\n",
+			  (const char *)&src_pixelformat,
+			  (const char *)&conv->dst_pixelformat,
+			  conv->converter->video_path, conv->converter->card);
+	else
+		v4l2r_log("converting %.4s to %.4s on the CPU (%s)\n",
+			  (const char *)&src_pixelformat,
+			  (const char *)&conv->dst_pixelformat,
+			  v4l2r_pixconv_have_simd() ? "NEON" : "C");
 
 	return VA_STATUS_SUCCESS;
-
-fail:
-	if (conv->fd >= 0)
-		close(conv->fd);
-	free(conv);
-	return VA_STATUS_ERROR_OPERATION_FAILED;
 }
 
 void v4l2r_convert_destroy(struct v4l2r_context *ctx)
@@ -164,12 +254,149 @@ void v4l2r_convert_destroy(struct v4l2r_context *ctx)
 		if ((conv->busy & (1u << i)) && conv->jobs[i].surface)
 			conv->jobs[i].surface->convert_pending = false;
 	}
+	for (unsigned int i = 0; i < ctx->nb_captures; i++) {
+		if ((conv->cpu_pending & (UINT64_C(1) << i)) &&
+		    ctx->captures[i].surface)
+			ctx->captures[i].surface->convert_pending = false;
+	}
+
+	if (conv->route == V4L2R_ROUTE_CPU && conv->cpu_frames)
+		v4l2r_log("CPU conversion: %llu frames, %.2f ms per frame\n",
+			  (unsigned long long)conv->cpu_frames,
+			  conv->cpu_ns / 1e6 / conv->cpu_frames);
 
 	/* Closing the fd tears down the m2m context including any queued
 	 * jobs; importer-side dma-buf references are dropped with it. */
-	close(conv->fd);
+	if (conv->fd >= 0)
+		close(conv->fd);
+	pthread_mutex_destroy(&conv->cpu_mutex);
 	free(conv);
 	ctx->conv = NULL;
+}
+
+/* --- CPU route --- */
+
+static void dmabuf_sync(int fd, uint64_t flags)
+{
+	struct dma_buf_sync sync = { .flags = flags };
+
+	if (fd < 0)
+		return;
+	while (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && errno == EINTR)
+		continue;
+}
+
+static unsigned int cpu_convert_threads(void)
+{
+	const char *env = getenv("V4L2R_CPU_CONVERT_THREADS");
+	long n;
+
+	if (env) {
+		n = strtol(env, NULL, 10);
+		if (n >= 1 && n <= 8)
+			return (unsigned int)n;
+	}
+
+	/* The RK3588 has four big cores. */
+	n = sysconf(_SC_NPROCESSORS_ONLN);
+	return n >= 4 ? 4 : n >= 1 ? (unsigned int)n : 1;
+}
+
+/* Convert the surface's decoded NV15 CAPTURE buffer into its backing.
+ * Called with conv->cpu_mutex held (not ctx->mutex). */
+static VAStatus cpu_convert(struct v4l2r_context *ctx,
+			    struct v4l2r_surface *surface)
+{
+	struct v4l2r_convert *conv = ctx->conv;
+	struct v4l2r_frame_view src, dst;
+	struct v4l2r_pixconv_frame frame;
+	uint64_t t0 = v4l2r_now_ns();
+	VAStatus status;
+	int ret;
+
+	status = v4l2r_surface_convert_backing(ctx->drv, surface);
+	if (status != VA_STATUS_SUCCESS)
+		return status;
+
+	status = v4l2r_surface_capture_view(surface, true, &src);
+	if (status != VA_STATUS_SUCCESS)
+		return status;
+	status = v4l2r_surface_view(ctx->drv, surface, true, &dst);
+	if (status != VA_STATUS_SUCCESS)
+		return status;
+	if (src.nb_planes != 1 || dst.nb_planes != 1)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	frame = (struct v4l2r_pixconv_frame) {
+		.src = src.map[0],
+		.src_size = src.plane_size[0],
+		.src_pitch = src.pitch,
+		.src_chroma_offset = (size_t)src.pitch * src.height,
+		.dst = dst.map[0],
+		.dst_size = dst.plane_size[0],
+		.dst_pitch = dst.pitch,
+		.dst_chroma_offset = (size_t)dst.pitch * dst.height,
+		.width = src.width,
+		.height = src.height,
+		.dst_p010 = conv->dst_pixelformat == V4L2_PIX_FMT_P010,
+	};
+
+	dmabuf_sync(src.dmabuf_fd[0], DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+	dmabuf_sync(dst.dmabuf_fd[0], DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+	ret = v4l2r_nv15_convert_frame(&frame, cpu_convert_threads());
+	dmabuf_sync(dst.dmabuf_fd[0], DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+	dmabuf_sync(src.dmabuf_fd[0], DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+
+	if (ret < 0) {
+		v4l2r_log("CPU conversion layout mismatch (%ux%u pitch %u -> pitch %u)\n",
+			  src.width, src.height, src.pitch, dst.pitch);
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+
+	conv->cpu_frames++;
+	conv->cpu_ns += v4l2r_now_ns() - t0;
+	v4l2r_trace("CPU conversion (surface 0x%08x buf #%d): %.2f ms\n",
+		    surface->id, surface->capture_index,
+		    (v4l2r_now_ns() - t0) / 1e6);
+
+	return VA_STATUS_SUCCESS;
+}
+
+/* Run (or skip, when nothing is pending) the surface's CPU conversion. */
+static VAStatus cpu_convert_wait(struct v4l2r_context *ctx,
+				 struct v4l2r_surface *surface)
+{
+	struct v4l2r_convert *conv = ctx->conv;
+	VAStatus status = VA_STATUS_SUCCESS;
+	uint64_t bit = 0;
+	int index;
+
+	pthread_mutex_lock(&conv->cpu_mutex);
+
+	pthread_mutex_lock(&ctx->mutex);
+	index = surface->capture_index;
+	if (index >= 0 && index < V4L2R_MAX_CAPTURE_BUFFERS)
+		bit = UINT64_C(1) << index;
+	if (!surface->convert_pending || !(conv->cpu_pending & bit))
+		bit = 0;
+	pthread_mutex_unlock(&ctx->mutex);
+
+	/* Decoder writes into this buffer wait on cpu_mutex (drain), so it
+	 * stays put while the CPU reads it. */
+	if (bit) {
+		status = cpu_convert(ctx, surface);
+		if (status != VA_STATUS_SUCCESS)
+			v4l2r_log("CPU format conversion failed\n");
+	}
+
+	pthread_mutex_lock(&ctx->mutex);
+	conv->cpu_pending &= ~bit;
+	surface->convert_pending = false;
+	pthread_mutex_unlock(&ctx->mutex);
+
+	pthread_mutex_unlock(&conv->cpu_mutex);
+
+	return status;
 }
 
 /*
@@ -258,6 +485,15 @@ void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index)
 	if (!surface)
 		return;
 
+	/* CPU route: convert when the frame is first read (most decoded
+	 * frames are, but a frame that is decoded again unread costs
+	 * nothing). */
+	if (conv->route == V4L2R_ROUTE_CPU) {
+		conv->cpu_pending |= UINT64_C(1) << capture_index;
+		surface->convert_pending = true;
+		return;
+	}
+
 	convert_reap(ctx, false);
 
 	/* All slots busy: wait one out. */
@@ -334,6 +570,28 @@ void v4l2r_convert_drain_index(struct v4l2r_context *ctx, int capture_index)
 	if (!conv)
 		return;
 
+	/* CPU route: the buffer is about to be decoded into again, for the
+	 * same surface (or after its surface was destroyed), so a conversion
+	 * nobody asked for is obsolete. cpu_mutex waits out one that is
+	 * running. */
+	if (conv->route == V4L2R_ROUTE_CPU) {
+		uint64_t bit = UINT64_C(1) << capture_index;
+
+		pthread_mutex_lock(&conv->cpu_mutex);
+		pthread_mutex_lock(&ctx->mutex);
+		if (conv->cpu_pending & bit) {
+			struct v4l2r_surface *surface =
+				ctx->captures[capture_index].surface;
+
+			conv->cpu_pending &= ~bit;
+			if (surface && surface->capture_index == capture_index)
+				surface->convert_pending = false;
+		}
+		pthread_mutex_unlock(&ctx->mutex);
+		pthread_mutex_unlock(&conv->cpu_mutex);
+		return;
+	}
+
 	pthread_mutex_lock(&ctx->mutex);
 	while (in_flight) {
 		in_flight = false;
@@ -358,6 +616,9 @@ VAStatus v4l2r_convert_wait(struct v4l2r_surface *surface)
 
 	if (!ctx || !ctx->conv)
 		return VA_STATUS_SUCCESS;
+
+	if (ctx->conv->route == V4L2R_ROUTE_CPU)
+		return cpu_convert_wait(ctx, surface);
 
 	pthread_mutex_lock(&ctx->mutex);
 	while (surface->convert_pending) {
@@ -665,8 +926,13 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 	struct v4l2r_driver *drv = ctx->drv;
 	struct v4l2_requestbuffers reqbufs;
 	enum v4l2_buf_type type;
+	const struct v4l2r_converter *converter =
+		v4l2r_converter_find(drv, src->pixelformat, V4L2_PIX_FMT_NV12);
 
-	if (vpp->fd >= 0 &&
+	if (!converter)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
+
+	if (vpp->fd >= 0 && vpp->converter == converter &&
 	    vpp->src_pixelformat == src->pixelformat &&
 	    vpp->src_width == src->width && vpp->src_height == src->height &&
 	    vpp->src_pitch == src->pitch &&
@@ -676,9 +942,10 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 
 	vpp_teardown(vpp);
 
-	vpp->fd = open(drv->converter.video_path, O_RDWR | O_NONBLOCK);
+	vpp->fd = open(converter->video_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (vpp->fd < 0)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
+	vpp->converter = converter;
 
 	if (vpp_set_format(vpp->fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 			   src->pixelformat, src->width, src->height,
@@ -730,8 +997,8 @@ static VAStatus vpp_configure(struct v4l2r_context *ctx,
 
 	v4l2r_log("processing %.4s %ux%u to NV12 %ux%u via %s [%s]\n",
 		  (const char *)&src->pixelformat, src->width, src->height,
-		  dst->width, dst->height, drv->converter.video_path,
-		  drv->converter.card);
+		  dst->width, dst->height, converter->video_path,
+		  converter->card);
 
 	return VA_STATUS_SUCCESS;
 
@@ -830,8 +1097,13 @@ VAStatus v4l2r_vpp_end_picture(struct v4l2r_context *ctx)
 	 * 10-bit NV15) instead of the converted backing: the rotation and
 	 * the downconversion then happen in the same pass. Only without a
 	 * horizontal crop offset - the converter addresses crop columns in
-	 * whole bytes, which cannot land mid-byte in packed 10-bit layouts. */
-	if (src->ctx && src->ctx->conv && src->capture_index >= 0 &&
+	 * whole bytes, which cannot land mid-byte in packed 10-bit layouts.
+	 * Not on the CPU route: no converter reads the raw format there. */
+	if (src->ctx && src->ctx->conv &&
+	    src->ctx->conv->route == V4L2R_ROUTE_HW &&
+	    v4l2r_converter_supports(ctx->drv,
+				     v4l2r_format_pixelformat(&src->ctx->capture_format)) &&
+	    src->capture_index >= 0 &&
 	    vpp->src_region.x == 0)
 		status = v4l2r_surface_capture_view(src, false, &src_view);
 	else

@@ -36,3 +36,16 @@ devpool_test = executable('devpool_test', 'devpool_test.c', '../src/devpool.c',
                           link_args: ['-Wl,--wrap=ioctl'],
                           dependencies: [threads_dep])
 test('devpool', devpool_test, timeout: 30)
+
+# CPU NV15 -> P010/NV12 conversion against a reference packer (bit-exact,
+# no read past a row, padded pitches, threads).
+pixconv_test = executable('pixconv_test', 'pixconv_test.c', '../src/pixconv.c',
+                          include_directories: include_directories('../src'),
+                          dependencies: [threads_dep])
+test('pixconv', pixconv_test, timeout: 120)
+
+# 10-bit format negotiation: offered surface formats and conversion routes.
+fmtsel_test = executable('fmtsel_test', 'fmtsel_test.c', '../src/fmtsel.c',
+                         include_directories: include_directories('../src'),
+                         dependencies: [libva_dep])
+test('fmtsel', fmtsel_test, timeout: 30)
