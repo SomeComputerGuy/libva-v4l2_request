@@ -1,3 +1,20 @@
+libva-v4l2-request (1.2+opi5.6-1) unstable; urgency=medium
+
+  * 10-bit HEVC/VP9 keep their depth: 10-bit configs offer P010 surfaces
+    (exported as DRM_FORMAT_P010) and the decoder's packed NV15 is
+    converted to P010 instead of truncated to NV12. The conversion runs on
+    a V4L2 mem2mem converter that can do it (RK3588 RGA3 with NV15 input),
+    else on the CPU (NEON, 4 threads) when the frame is first read.
+  * Keep every mem2mem converter found, not only the first one: on the
+    RK3588 the first is the RGA2, which cannot read NV15.
+  * With the CPU route, HEVC Main10 and VP9 Profile 2 are now also offered
+    on kernels whose RGA cannot read NV15 (V4L2R_NO_CPU_CONVERT=1 turns
+    this off).
+  * NV12 output for 8-bit streams is unchanged.
+  * vaprobe lists the surface formats of each decode config.
+
+ -- Arun Iyengar <aiyengar1990@gmail.com>  Fri, 06 Nov 2026 01:10:00 +0000
+
 libva-v4l2-request (1.2+opi5.5-1) unstable; urgency=medium
 
   * Reset pooled decoder descriptors with the device's own queue types: the
