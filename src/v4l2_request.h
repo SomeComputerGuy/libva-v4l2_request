@@ -315,6 +315,10 @@ struct v4l2r_context {
 	uint64_t submitted;
 	uint64_t completed;
 	pthread_mutex_t mutex;
+	/* Serializes the codec state: the decode entrypoints (Begin/Render/
+	 * EndPicture) against v4l2r_flush_surface() from reader threads, which
+	 * may submit a frame the codec still holds back (AV1). Recursive. */
+	pthread_mutex_t codec_mutex;
 
 	struct v4l2r_capture_buffer captures[V4L2R_MAX_CAPTURE_BUFFERS];
 	unsigned int nb_captures;
@@ -415,6 +419,10 @@ struct v4l2r_driver {
 	 * one (see v4l2r_converter_available). It has its own lock because
 	 * callers may hold drv->mutex (e.g. vaQueryConfigProfiles). */
 	pthread_mutex_t converter_mutex;
+	/* Readers of surface memory (sync, status, images, export, surface
+	 * destruction) hold this shared; vaDestroyContext() holds it exclusive
+	 * while it hands the decoded frames of its surfaces over to them. */
+	pthread_rwlock_t ctx_lock;
 	struct v4l2r_converter converters[V4L2R_MAX_CONVERTERS];
 	unsigned int nb_converters;
 	bool converter_probed;

@@ -118,7 +118,7 @@ fail:
 	return status;
 }
 
-VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
+static VAStatus v4l2r_DeriveImage_locked(VADriverContextP va_ctx, VASurfaceID surface_id,
 			   VAImage *image)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
@@ -211,6 +211,19 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	return VA_STATUS_SUCCESS;
 }
 
+VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
+			   VAImage *image)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->ctx_lock);
+	status = v4l2r_DeriveImage_locked(va_ctx, surface_id, image);
+	pthread_rwlock_unlock(&drv->ctx_lock);
+
+	return status;
+}
+
 VAStatus v4l2r_DestroyImage(VADriverContextP va_ctx, VAImageID image_id)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
@@ -237,7 +250,7 @@ VAStatus v4l2r_SetImagePalette(VADriverContextP va_ctx, VAImageID image,
 	return VA_STATUS_ERROR_UNIMPLEMENTED;
 }
 
-VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
+static VAStatus v4l2r_GetImage_locked(VADriverContextP va_ctx, VASurfaceID surface_id,
 			int x, int y, unsigned int width, unsigned int height,
 			VAImageID image_id)
 {
@@ -326,7 +339,21 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
+VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
+			int x, int y, unsigned int width, unsigned int height,
+			VAImageID image_id)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->ctx_lock);
+	status = v4l2r_GetImage_locked(va_ctx, surface_id, x, y, width, height, image_id);
+	pthread_rwlock_unlock(&drv->ctx_lock);
+
+	return status;
+}
+
+static VAStatus v4l2r_PutImage_locked(VADriverContextP va_ctx, VASurfaceID surface_id,
 			VAImageID image_id, int src_x, int src_y,
 			unsigned int src_width, unsigned int src_height,
 			int dest_x, int dest_y, unsigned int dest_width,
@@ -422,6 +449,22 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		       row_size);
 
 	return VA_STATUS_SUCCESS;
+}
+
+VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
+			VAImageID image_id, int src_x, int src_y,
+			unsigned int src_width, unsigned int src_height,
+			int dest_x, int dest_y, unsigned int dest_width,
+			unsigned int dest_height)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->ctx_lock);
+	status = v4l2r_PutImage_locked(va_ctx, surface_id, image_id, src_x, src_y, src_width, src_height, dest_x, dest_y, dest_width, dest_height);
+	pthread_rwlock_unlock(&drv->ctx_lock);
+
+	return status;
 }
 
 /* --- subpictures are not supported --- */

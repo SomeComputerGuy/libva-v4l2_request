@@ -85,7 +85,7 @@ VAStatus v4l2r_CreateSurfaces(VADriverContextP va_ctx, int width, int height,
 				     num_surfaces, NULL, 0);
 }
 
-VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_list,
+static VAStatus v4l2r_DestroySurfaces_locked(VADriverContextP va_ctx, VASurfaceID *surface_list,
 			       int num_surfaces)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
@@ -117,7 +117,20 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_SyncSurface(VADriverContextP va_ctx, VASurfaceID render_target)
+VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_list,
+			       int num_surfaces)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->ctx_lock);
+	status = v4l2r_DestroySurfaces_locked(va_ctx, surface_list, num_surfaces);
+	pthread_rwlock_unlock(&drv->ctx_lock);
+
+	return status;
+}
+
+static VAStatus v4l2r_SyncSurface_locked(VADriverContextP va_ctx, VASurfaceID render_target)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 	struct v4l2r_surface *surface;
@@ -129,7 +142,19 @@ VAStatus v4l2r_SyncSurface(VADriverContextP va_ctx, VASurfaceID render_target)
 	return v4l2r_surface_ready(surface);
 }
 
-VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
+VAStatus v4l2r_SyncSurface(VADriverContextP va_ctx, VASurfaceID render_target)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->ctx_lock);
+	status = v4l2r_SyncSurface_locked(va_ctx, render_target);
+	pthread_rwlock_unlock(&drv->ctx_lock);
+
+	return status;
+}
+
+static VAStatus v4l2r_QuerySurfaceStatus_locked(VADriverContextP va_ctx,
 				  VASurfaceID render_target,
 				  VASurfaceStatus *status)
 {
@@ -158,6 +183,20 @@ VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
 		*status = VASurfaceRendering;
 
 	return VA_STATUS_SUCCESS;
+}
+
+VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
+				  VASurfaceID render_target,
+				  VASurfaceStatus *status)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus ret;
+
+	pthread_rwlock_rdlock(&drv->ctx_lock);
+	ret = v4l2r_QuerySurfaceStatus_locked(va_ctx, render_target, status);
+	pthread_rwlock_unlock(&drv->ctx_lock);
+
+	return ret;
 }
 
 VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config,
@@ -896,7 +935,7 @@ static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_id,
+static VAStatus v4l2r_ExportSurfaceHandle_locked(VADriverContextP va_ctx, VASurfaceID surface_id,
 				   uint32_t mem_type, uint32_t flags,
 				   void *descriptor)
 {
@@ -924,6 +963,20 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
 		return status;
 
 	return fill_prime_descriptor(&view, surface, flags, descriptor);
+}
+
+VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_id,
+				   uint32_t mem_type, uint32_t flags,
+				   void *descriptor)
+{
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	VAStatus status;
+
+	pthread_rwlock_rdlock(&drv->ctx_lock);
+	status = v4l2r_ExportSurfaceHandle_locked(va_ctx, surface_id, mem_type, flags, descriptor);
+	pthread_rwlock_unlock(&drv->ctx_lock);
+
+	return status;
 }
 
 /* --- unsupported display path --- */

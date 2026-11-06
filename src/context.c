@@ -580,9 +580,17 @@ void v4l2r_context_release_capture(struct v4l2r_context *ctx, int index)
 
 void v4l2r_flush_surface(struct v4l2r_surface *surface)
 {
-	if (surface && surface->ctx && surface->ctx->codec &&
-	    surface->ctx->codec->flush)
-		surface->ctx->codec->flush(surface->ctx, surface);
+	struct v4l2r_context *ctx = surface ? surface->ctx : NULL;
+
+	if (!ctx || !ctx->codec || !ctx->codec->flush)
+		return;
+
+	/* The decode thread may be submitting the held frame itself right
+	 * now; once it has, the surface has its CAPTURE buffer and the flush
+	 * finds nothing to do. */
+	pthread_mutex_lock(&ctx->codec_mutex);
+	ctx->codec->flush(ctx, surface);
+	pthread_mutex_unlock(&ctx->codec_mutex);
 }
 
 VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
@@ -745,6 +753,14 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 	ctx->video_fd = -1;
 	ctx->media_fd = -1;
 	pthread_mutex_init(&ctx->mutex, NULL);
+	{
+		pthread_mutexattr_t attr;
+
+		pthread_mutexattr_init(&attr);
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+		pthread_mutex_init(&ctx->codec_mutex, &attr);
+		pthread_mutexattr_destroy(&attr);
+	}
 	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++)
 		ctx->output[i].request_fd = -1;
 
@@ -909,6 +925,78 @@ fail:
 	return status;
 }
 
+/*
+ * VA-API surfaces outlive the context that decoded into them: FFmpeg, for
+ * one, destroys the decode context when the stream ends while the last
+ * frames are still queued for its filters, and reads them afterwards. The
+ * pixels live in this context's CAPTURE buffers (and, behind a converter,
+ * in the surface backing), so before the queues go away every surface that
+ * still shows a decoded frame gets that frame as its own standalone
+ * backing: finished conversions keep the converted backing; otherwise the
+ * CAPTURE buffer's dma-buf and mapping move to the surface (both keep the
+ * memory alive after the queue is freed, and a derived image keeps
+ * pointing at valid memory). drv->ctx_lock is held exclusive.
+ */
+static void hand_over_frames(struct v4l2r_context *ctx)
+{
+	if (!ctx->streaming)
+		return;
+
+	/* A frame the codec still holds back is a frame the client already
+	 * has; submit it. */
+	pthread_mutex_lock(&ctx->codec_mutex);
+	if (ctx->codec && ctx->codec->flush)
+		ctx->codec->flush(ctx, NULL);
+	pthread_mutex_unlock(&ctx->codec_mutex);
+
+	for (unsigned int i = 0; i < ctx->nb_captures; i++) {
+		struct v4l2r_capture_buffer *capture = &ctx->captures[i];
+		struct v4l2r_surface *surface = capture->surface;
+		struct v4l2r_surface_backing *backing;
+
+		if (!surface || surface->capture_index != (int)i)
+			continue;
+
+		if (v4l2r_sync_capture(ctx, (int)i) != VA_STATUS_SUCCESS)
+			continue;
+
+		if (ctx->conv) {
+			/* The converted frame is the presented one; the raw
+			 * decoder buffer is not needed any more. */
+			v4l2r_convert_wait(surface);
+			continue;
+		}
+
+		if (v4l2r_export_capture_dmabufs(ctx, capture, (int)i) < 0)
+			continue;
+
+		backing = calloc(1, sizeof(*backing));
+		if (!backing)
+			continue;
+
+		backing->pixelformat = v4l2r_format_pixelformat(&ctx->capture_format);
+		backing->width = v4l2r_format_width(&ctx->capture_format);
+		backing->height = v4l2r_format_height(&ctx->capture_format);
+		backing->pitch = v4l2r_format_bytesperline(&ctx->capture_format);
+		backing->nb_planes = capture->nb_planes;
+		for (unsigned int p = 0; p < VIDEO_MAX_PLANES; p++) {
+			backing->dmabuf_fd[p] = -1;
+			if (p >= capture->nb_planes)
+				continue;
+			backing->plane_size[p] = capture->plane_size[p];
+			backing->dmabuf_fd[p] = capture->dmabuf_fd[p];
+			backing->map[p] = capture->map[p];
+			capture->dmabuf_fd[p] = -1;
+			capture->map[p] = NULL;
+		}
+
+		v4l2r_surface_free_backing(surface);
+		surface->backing = backing;
+		v4l2r_trace("surface 0x%08x keeps CAPTURE buffer #%u past its context\n",
+			    surface->id, i);
+	}
+}
+
 VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
@@ -920,6 +1008,11 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 	ctx = V4L2R_CONTEXT_GET(drv, context_id);
 	if (!ctx)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+	/* No reader may resolve a surface of this context while it goes. */
+	pthread_rwlock_wrlock(&drv->ctx_lock);
+
+	hand_over_frames(ctx);
 
 	if (ctx->video_fd >= 0 && ctx->streaming) {
 		type = ctx->output_format.type;
@@ -956,10 +1049,13 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 		ctx->codec->uninit(ctx);
 	free(ctx->codec_priv);
 	pthread_mutex_destroy(&ctx->mutex);
+	pthread_mutex_destroy(&ctx->codec_mutex);
 
 	pthread_mutex_lock(&drv->mutex);
 	v4l2r_handles_free(&drv->contexts, context_id);
 	pthread_mutex_unlock(&drv->mutex);
+
+	pthread_rwlock_unlock(&drv->ctx_lock);
 
 	return VA_STATUS_SUCCESS;
 }
@@ -987,16 +1083,16 @@ VAStatus v4l2r_BeginPicture(VADriverContextP va_ctx, VAContextID context_id,
 	if (ctx->vpp)
 		return v4l2r_vpp_begin_picture(ctx, surface);
 
+	pthread_mutex_lock(&ctx->codec_mutex);
 	status = v4l2r_picture_begin(ctx, surface);
-	if (status != VA_STATUS_SUCCESS)
-		return status;
+	if (status == VA_STATUS_SUCCESS) {
+		ctx->in_picture = true;
+		if (ctx->codec->begin_picture)
+			status = ctx->codec->begin_picture(ctx);
+	}
+	pthread_mutex_unlock(&ctx->codec_mutex);
 
-	ctx->in_picture = true;
-
-	if (ctx->codec->begin_picture)
-		return ctx->codec->begin_picture(ctx);
-
-	return VA_STATUS_SUCCESS;
+	return status;
 }
 
 VAStatus v4l2r_RenderPicture(VADriverContextP va_ctx, VAContextID context_id,
@@ -1012,20 +1108,23 @@ VAStatus v4l2r_RenderPicture(VADriverContextP va_ctx, VAContextID context_id,
 	if (!ctx->in_picture)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	for (int i = 0; i < num_buffers; i++) {
+	status = VA_STATUS_SUCCESS;
+	pthread_mutex_lock(&ctx->codec_mutex);
+	for (int i = 0; i < num_buffers && status == VA_STATUS_SUCCESS; i++) {
 		struct v4l2r_buffer *buffer;
 
 		buffer = V4L2R_BUFFER_GET(drv, buffers[i]);
-		if (!buffer)
-			return VA_STATUS_ERROR_INVALID_BUFFER;
+		if (!buffer) {
+			status = VA_STATUS_ERROR_INVALID_BUFFER;
+			break;
+		}
 
 		status = ctx->vpp ? v4l2r_vpp_render_buffer(ctx, buffer) :
 			 ctx->codec->render_buffer(ctx, buffer);
-		if (status != VA_STATUS_SUCCESS)
-			return status;
 	}
+	pthread_mutex_unlock(&ctx->codec_mutex);
 
-	return VA_STATUS_SUCCESS;
+	return status;
 }
 
 VAStatus v4l2r_EndPicture(VADriverContextP va_ctx, VAContextID context_id)
@@ -1040,12 +1139,23 @@ VAStatus v4l2r_EndPicture(VADriverContextP va_ctx, VAContextID context_id)
 	if (!ctx->in_picture)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	status = ctx->vpp ? v4l2r_vpp_end_picture(ctx) :
-		 ctx->codec->end_picture(ctx);
+	if (ctx->vpp) {
+		/* Reads its source surface: keep that surface's context alive. */
+		pthread_rwlock_rdlock(&drv->ctx_lock);
+		status = v4l2r_vpp_end_picture(ctx);
+		pthread_rwlock_unlock(&drv->ctx_lock);
+		ctx->in_picture = false;
+		ctx->pic.output = NULL;
+		ctx->pic.target = NULL;
+		return status;
+	}
 
+	pthread_mutex_lock(&ctx->codec_mutex);
+	status = ctx->codec->end_picture(ctx);
 	ctx->in_picture = false;
 	ctx->pic.output = NULL;
 	ctx->pic.target = NULL;
+	pthread_mutex_unlock(&ctx->codec_mutex);
 
 	return status;
 }
